@@ -1,0 +1,736 @@
+//--------------------------------------
+//--- 010 Editor v14.0 Binary Template
+//
+// File:        gca_format.bt
+// Author:      Jille / MQBTools
+// Revision:    1.2
+// Purpose:     MIB2/MIB3 "GenericCarAdjuster" (.gca) binary config file
+//              parser. .gca files describe button / image / background
+//              layouts for MIB2/MIB3 in-car HMI widgets (climate, seat,
+//              generic car-adjuster screens etc). One file per
+//              screen/config, tiny (usually well under a few KB). The
+//              on-disk format is auto-detected (see MIB2 support note
+//              below) -- there is nothing for the user to select.
+//
+// Source of truth: the MIB3 half of this template is a byte-exact
+// transcription of the deserialization logic decompiled from
+// MIBHMI-STD-H42.325.89-bin.jar:
+//   de.vw.mib.widgets.car.generic.GenericCarAdjusterConfigData   (readers)
+//   de.vw.mib.widgets.car.generic.GenericCarAdjusterConstants    (control
+//                                                                 flags + field
+//                                                                 index constants)
+//   de.vw.mib.widgets.car.AbstractConfigData                     (primitive
+//                                                                 getShort()/
+//                                                                 getString()
+//                                                                 readers)
+// Unlike most MQBTools binary templates this one is NOT a hypothesis —
+// every field, count, and control-flag string below is read directly off
+// the decompiled bytecode, not inferred from sample files. The one thing
+// that *is* unconfirmed is the real-world *meaning* of a couple of numeric
+// values (configurationIntention, aspectId cross-references) — those are
+// flagged cRed below even though their on-disk position/type is certain.
+//
+// Revision 1.2 update: a corpus of 92 real-world MIB3 .gca files (626 BTN
+// records, 1740 IMG records) was analyzed to confirm/refine several of the
+// previously-cRed-flagged fields' real-world semantics. See the "EMPIRICAL
+// OBSERVATIONS" block further down for the full write-up. Headline result:
+// IMG.featureId is now CONFIRMED (cBlue) as a direct 0-based index into the
+// FN (feature name) table -- IMG[i].featureId == i and FN[i] is that
+// image's human-readable feature name in every CarStatus_Tile-family
+// sample observed. The other cross-reference fields (BTN.aspectId,
+// BCKG.aspectId, CI.configurationIntention) remain cRed -- their on-disk
+// position is certain but no matching lookup table was found in this
+// corpus, so their target/meaning is still unconfirmed.
+//
+// MIB2 support: this template ALSO parses a second, older on-disk layout
+// seen in real MIB2 .gca samples that share the exact same 6-byte header
+// (magic 0xFECA, version, fileLength) but have NO control-flag strings
+// before each section, and whose IMG/BCKG records are 4 shorts instead of
+// 5 (no trailing "colored" / "scale" field). BTN records are byte-identical
+// between the two formats (21 shorts). Only the V4-shaped 3-section body
+// (BTN, IMG, BCKG) has been observed for MIB2 -- there is no known MIB2
+// equivalent of the V5/V51-53 CI/FGP/FPWFG/SVID/SVN/FN sections. The
+// format is sniffed automatically (see GcaSniffIsMib2() below) by peeking
+// at offset 0x06: if it decodes to the MIB3 control-flag string "BTN" or
+// "CI" (the only two tags that can legally open a MIB3 file), the file is
+// MIB3; otherwise it's treated as MIB2. This mirrors detectGcaFormat() in
+// templates/gca.html exactly, so both parsers agree on every sample.
+//
+// NOTE: there is a THIRD, unrelated, older best-effort GCA parser
+// elsewhere in this repo (tools/gca_parser.html) reverse-engineered from a
+// different, older MIB2 "filetype 1/4/5" layout (configurationIntention
+// doubling as a filetype switch, zone lists, polygon records, etc). That
+// format is NOT what this template parses and is unrelated to the MIB2
+// support described above -- do not confuse the two. This template covers
+// the MIB3 version-numbered (4 / 5 / 51 / 52 / 53) GenericCarAdjuster
+// layout confirmed above, plus the sibling MIB2 layout with the same
+// header and BTN/IMG/BCKG section shapes but no control-flag strings.
+//
+// ------------------------------------------------------------------------
+// Primitive encoding (AbstractConfigData):
+//   getShort(stream): reads 2 bytes, returns Java `short`
+//       value = (short)((byte1 & 0xFF) << 8 | byte0 & 0xFF)   -> little-endian, SIGNED
+//   getString(stream): short numberOfCharacters, then that many getShort()
+//       calls, each cast to `char` and appended -> effectively a
+//       length-prefixed UTF-16LE string: u16-LE count + count * u16-LE
+//       code units (each code unit read the same signed-LE way as above).
+//   ALL multi-byte primitives in this format are 16-bit, little-endian.
+//   There are no 8/32/64-bit fields anywhere in this format.
+//
+// Header (6 bytes, always present, all versions):
+//   +0  short magic        must equal -310 (0xFECA as raw bytes: CA FE)
+//   +2  short version       4, 5, 51, 52, or 53 -- selects section layout
+//   +4  short fileLength    reported total file size in bytes (informational;
+//                           used by the Java reader only to size its stream
+//                           read-ahead buffer, not re-validated against the
+//                           actual section data afterwards)
+//   Data sections start immediately at offset 6.
+//
+// Version -> section layout dispatch (GenericCarAdjusterConfigData.createReader):
+//   version <= 4   -> "V4"  layout,  3 sections: BTN, IMG, BCKG
+//   version == 5   -> "V5"  layout,  8 sections: CI, BTN, IMG, BCKG,
+//                                                 BTN(supplemental), SVID, SVN, FN
+//   version >  5   -> "V53" layout, 10 sections: CI, FGP, FPWFG, BTN, IMG,
+//                                                 BCKG, BTN(supplemental),
+//                                                 SVID, SVN, FN
+//   (the "> 5" branch is literally an unconditional else in the decompiled
+//   switch -- it is used for 51/52/53 but would also fire for any other
+//   value > 5, so this template mirrors that exact <= 4 / == 5 / > 5 test
+//   rather than hard-matching {51,52,53})
+//
+// EVERY section -- in EVERY version, including V4 -- is preceded by a
+// length-prefixed control-flag string (e.g. "BTN", "IMG", "CI", ...) that
+// the Java reader validates with checkControlFlag(). Critically,
+// checkControlFlag() NEVER aborts parsing on a mismatch -- it only logs an
+// error and the reader unconditionally continues on to read the section's
+// data right afterwards. This template mirrors that: a control-flag
+// mismatch raises a Warning() but parsing always continues.
+//
+// Record layouts (GenericCarAdjusterConstants field-index constants),
+// MIB3 sizes shown; MIB2 differences noted inline:
+//   BTN record  (21 shorts, MIB2 and MIB3 identical): id, imagePosX,
+//                             imagePosY, validCoords, 8x(vertexX,vertexY),
+//                             aspectId
+//                             [imagePosX/imagePosY observed as always 0 --
+//                             see EMPIRICAL OBSERVATIONS]
+//   IMG record  ( 5 shorts MIB3 / 4 shorts MIB2): id, featureId, posX,
+//                             posY, colored(0/1) [MIB3 only -- MIB2 record
+//                             ends after posY]
+//                             [featureId CONFIRMED: 0-based index into FN
+//                             table, see EMPIRICAL OBSERVATIONS]
+//   BCKG record ( 5 shorts MIB3 / 4 shorts MIB2): id, aspectId, posX,
+//                             posY, scale [MIB3 only -- MIB2 record ends
+//                             after posY]
+//                             [BCKG section empty in every observed sample
+//                             -- see EMPIRICAL OBSERVATIONS]
+//   MIB3: each of BTN/IMG/BCKG sections is control-flag string, short
+//   count, then `count` fixed-size records read back-to-back (no
+//   per-record length prefix -- record size is fixed by the constant
+//   field count).
+//   MIB2: each of BTN/IMG/BCKG sections is JUST the short count followed
+//   directly by `count` fixed-size records -- there is no control-flag
+//   string anywhere in a MIB2 file.
+//
+//   FGP    (V51/52/53 only): control-flag "FGP", short count, `count` shorts
+//                             (feature-group IDs, priority-ordered)
+//   FPWFG  (V51/52/53 only): control-flag "FPWFG", then a jagged 3D array:
+//                             short outerCount; outerCount * {
+//                               short midCount; midCount * {
+//                                 short innerCount; innerCount * short
+//                               }
+//                             }
+//   SVID: control-flag "SVID", short count, `count` shorts (scene view IDs)
+//   SVN:  control-flag "SVN",  short count, `count` GCA strings (scene view
+//         names, matched positionally to SVID's IDs by the reader)
+//   FN:   control-flag "FN",   short count, `count` GCA strings (feature names)
+//   CI:   control-flag "CI",   short configurationIntention (single value)
+//
+// Color coding:
+//   cLtGreen = Verified field, on-disk type AND real-world meaning both
+//              confirmed from decompiled source
+//   cYellow  = Structural field (length/count prefix) -- required to walk
+//              the file correctly, but not itself "data"
+//   cPurple  = Control-flag string preceding a section (see checkControlFlag
+//              note above)
+//   cLtGray  = String character data (scene-view / feature name text)
+//   cRed     = On-disk position/type is certain, but the real-world
+//              *meaning* of the value is not confirmed from the decompiled
+//              code alone (configurationIntention's semantics; aspectId is
+//              a cross-reference key into other, unparsed, car-specific
+//              config data whose target table has not been located)
+//   cBlue    = On-disk position/type AND real-world meaning both confirmed
+//              via empirical analysis of real sample files (as opposed to
+//              cLtGreen, which is confirmed via decompiled source alone).
+//              Currently used only for IMG.featureId -- see EMPIRICAL
+//              OBSERVATIONS below.
+//   cSilver  = Header "reported file length" -- informational only, not
+//              re-validated by the original Java reader
+//
+// ------------------------------------------------------------------------
+// EMPIRICAL OBSERVATIONS (92 real-world MIB3 .gca files: 626 BTN records,
+// 1740 IMG records, 40 V5 files with a supplemental BTN section, 92 BCKG
+// sections). These are corpus-level patterns, not spec guarantees -- a
+// file outside this sample could still legally differ.
+//
+//   1. BTN.imagePosX / BTN.imagePosY -- always 0 in all 626 observed
+//      records. Never seen non-zero. Likely a vestigial/legacy field not
+//      actively used by modern GCA files (the HMI presumably derives the
+//      button's image position from its vertex geometry instead).
+//
+//   2. BTN.validCoords -- always exactly 4 in all observed records. The
+//      8-vertex polygon capability the format supports on disk is never
+//      exercised in practice -- every button zone observed is a simple
+//      axis-aligned rectangle (4 corners), never a richer polygon.
+//
+//   3. BTN.aspectId -- only ever -1 or 0 across all observed records. This
+//      is a binary flag pattern (0 = default aspect, -1 = a distinguished
+//      "special" aspect), NOT a rich multi-valued cross-reference into a
+//      large aspect table as the field's cross-reference-key framing might
+//      suggest. Real-world target table still not located, so this stays
+//      cRed, but its *range* is now empirically pinned down.
+//
+//   4. IMG.featureId -- CONFIRMED (promoted cRed -> cBlue): it is a direct
+//      0-based index into the file's own FN (feature name) table when one
+//      is present (V5+ files). In every observed CarStatus_Tile-family
+//      file, IMG[i].featureId == i and FN[i]'s decoded string is exactly
+//      that image's human-readable feature name. It does NOT reliably
+//      reference BTN.id -- the two are unrelated ID spaces. (V4 files have
+//      no FN table at all, so featureId's target there is unresolved --
+//      this finding applies specifically to files where an FN section
+//      exists.)
+//
+//   5. IMG.colored -- observed as always 1 across all 1740 IMG records in
+//      this corpus; the 0 value is never seen in practice even though it
+//      is a legal, distinctly-handled value in the decompiled reader
+//      (isImageColored() == (value==1)). Meaning of "colored" itself is
+//      still not confirmed -- field kept editable/cLtGreen, this is just a
+//      corpus rarity note, not a hard constraint.
+//
+//   6. BCKG section -- empty (backgroundCount == 0, no records) in all 92
+//      observed files. No real-world BCKG.aspectId / posX / posY / scale
+//      values were available to inspect in this sample, so nothing new
+//      can be confirmed about BCKG record semantics beyond what the
+//      decompiled source already gives.
+//
+//   7. Supplemental BTN section (the second "BTN"-tagged section in V5/
+//      V51-53 layouts) -- empty (buttonCount == 0) in all 40 V5 files
+//      observed. This mechanism (a second, independent button table late
+//      in the file) appears to be defined by the format but unused in
+//      practice across this corpus.
+//
+//   8. IMG.posX / IMG.posY -- confirmed to allow negative values in real
+//      data (e.g. posY = -43 observed repeatedly across multiple "Car
+//      widget" file variants). These are absolute pixel coordinates within
+//      the widget's interior display area; a negative Y is valid and
+//      represents an icon positioned above the nominal frame origin, not
+//      an encoding error or an unsigned/wrapped value.
+//--------------------------------------
+
+LittleEndian();
+
+// ============================================================
+// ENUMS
+// ============================================================
+typedef enum <short> {
+    GCA_VERSION_4  = 4,   // "V4"  layout -- 3 sections (BTN, IMG, BCKG)
+    GCA_VERSION_5  = 5,   // "V5"  layout -- 8 sections
+    GCA_VERSION_51 = 51,  // "V53" layout -- 10 sections (any version > 5 uses this layout)
+    GCA_VERSION_52 = 52,  // "V53" layout
+    GCA_VERSION_53 = 53   // "V53" layout (GENERICCARADJUSTER_CONFIG_VERSION_CURRENT)
+} GcaVersionHint;   // display hint only -- actual dispatch below uses <=4 / ==5 / >5, not this enum
+
+// ============================================================
+// STRING TYPE
+//
+// AbstractConfigData#getString(): short numberOfCharacters, then that many
+// getShort() calls appended as chars -- i.e. a u16-LE length prefix
+// followed by that many u16-LE UTF-16 code units, no null terminator.
+// Used both for control-flag tags ("BTN", "CI", "FGP", ...) and for the
+// SVN / FN human-readable name tables.
+// ============================================================
+struct GCA_String {
+    short length <bgcolor=cYellow, comment="Number of UTF-16LE code units that follow (Java `short`, so files with >32767-char strings would read negative -- not expected in practice)">;
+    if (length > 0)
+        ushort chars[length] <bgcolor=cLtGray, comment="UTF-16LE code units (one per array element)">;
+};
+
+// Decodes a GCA_String back into a display string. ASCII-range control
+// flags and typical Latin feature/button names round-trip correctly;
+// characters outside the BMP-as-single-unit range are not specially
+// handled since the source Java itself does a naive (char) cast per unit.
+string GcaStringRead(GCA_String &s) {
+    local string result = "";
+    local int i;
+    if (s.length <= 0) return "";
+    for (i = 0; i < s.length; i++)
+        result += (char)s.chars[i];
+    return result;
+}
+
+// Mirrors AbstractGenericCarConfigReader#checkControlFlag(): compares the
+// just-read control-flag string against the expected tag and warns (but
+// never aborts -- the decompiled Java always keeps parsing) on mismatch.
+void GcaCheckFlag(GCA_String &s, string expected) {
+    local string actual = GcaStringRead(s);
+    if (actual != expected)
+        Warning("GCA: control flag mismatch at 0x%X -- expected \"%s\", got \"%s\" (parsing continues, matching decompiled checkControlFlag behavior)", startof(s), expected, actual);
+}
+
+// ============================================================
+// FORMAT SNIFFER -- MIB2 vs MIB3
+//
+// Mirrors detectGcaFormat() / peekGcaString() / looksLikeMib3ControlFlag()
+// in templates/gca.html exactly, restricted to the two tags that can
+// legally open a MIB3 file's body (V4 layout starts with a "BTN" section,
+// V5/V51-53 layouts start with a "CI" section) -- any other bytes at
+// offset 0x06 mean the file has no control-flag strings at all and is
+// therefore MIB2.
+//
+// Uses ReadShort()/ReadUShort() with explicit positions, which -- unlike
+// declaring a typed field inside a struct -- read the file WITHOUT moving
+// the template's parse cursor, so this can be called as a pure peek before
+// any section struct is instantiated.
+// ============================================================
+int GcaSniffIsMib2() {
+    local short len;
+    local string s;
+    local int i;
+
+    if (FileSize() < 8)
+        return 0; // not enough room to peek a length-prefixed string at 0x06 -- fall back to MIB3 so parseGca-style errors surface normally
+
+    len = ReadShort(6);
+    if (len <= 0 || len > 10)
+        return 1; // not a plausible short control-flag string length ("BTN"=3, "CI"=2) -- MIB2
+    if (8 + (int)len * 2 > FileSize())
+        return 1; // string would run past EOF -- can't be a real control flag -- MIB2
+
+    s = "";
+    for (i = 0; i < len; i++)
+        s += (char)ReadUShort(8 + i * 2);
+
+    return (s == "BTN" || s == "CI") ? 0 : 1;
+}
+
+// ============================================================
+// HEADER (6 bytes, offsets 0x00-0x05, always present regardless of version)
+// ============================================================
+struct GCA_Header {
+    short magic       <bgcolor=cLtGreen, comment="Must equal -310 / 0xFECA (raw bytes CA FE) -- AbstractConfigData.MAGIC_NUMBER">;
+    short version      <bgcolor=cLtGreen, comment="4, 5, 51, 52, or 53 -- selects section layout below">;
+    short fileLength   <bgcolor=cSilver, comment="Reported total file size in bytes; used only to size the Java reader's stream buffer, not re-validated afterwards">;
+};
+
+// ============================================================
+// MIB2 VS MIB3 FORMAT FLAG
+//
+// Declared here (default 0 = MIB3) so the section/record structs further
+// down can branch on it. The real value is computed by GcaSniffIsMib2()
+// (defined below, after GCA_String/GcaStringRead so it can reuse them) and
+// assigned in the MAIN PARSE section right after the header is read --
+// i.e. before any section struct that reads it is actually instantiated.
+// ============================================================
+local int isMib2 = 0;
+
+// ============================================================
+// SHARED RECORD TYPES
+// ============================================================
+struct GCA_Point {
+    short x <bgcolor=cLtGreen>;
+    short y <bgcolor=cLtGreen>;
+};
+
+// GenericCarAdjusterConstants: BUTTON_* field indices, 21 shorts/record.
+struct GCA_ButtonRecord {
+    short id          <bgcolor=cLtGreen, comment="BUTTON_ID">;
+    short imagePosX   <bgcolor=cLtGreen, comment="BUTTON_IMAGE_POS_X -- observed as always 0 across 626 real records (92-file corpus); likely a vestigial/legacy field not actively used by modern GCA files, on-disk position/type still certain">;
+    short imagePosY   <bgcolor=cLtGreen, comment="BUTTON_IMAGE_POS_Y -- observed as always 0 across 626 real records (92-file corpus); likely a vestigial/legacy field not actively used by modern GCA files, on-disk position/type still certain">;
+    short validCoords <bgcolor=cYellow,  comment="BUTTON_VALID_COORDS -- number of the 8 vertex slots below actually in use (0-8); the remaining slots are still present on disk but are padding, not extra geometry. Empirically always exactly 4 across all observed records -- the 8-vertex polygon capability is never exercised, every observed button zone is a simple rectangle">;
+    GCA_Point vertex[8] <bgcolor=cLtGreen, comment="BUTTON_POS_X_1..BUTTON_POS_Y_8 -- up to 8 polygon vertices; only the first `validCoords` are meaningful (empirically always 4, i.e. a plain rectangle)">;
+    short aspectId    <bgcolor=cRed, comment="BUTTON_ASPECT_ID -- cross-reference key into other (unparsed) car-specific config data; on-disk position confirmed, target table not located. Empirically behaves as a binary FLAG, not a rich multi-valued identifier: only -1 or 0 observed across all records (0 = default aspect, -1 = a distinguished special aspect)">;
+};
+
+// GenericCarAdjusterConstants: IMAGE_* field indices. 5 shorts/record in
+// MIB3; MIB2 records are 4 shorts -- they end after posY, with no
+// "colored" field on disk at all (not just defaulted/omitted-but-present).
+struct GCA_ImageRecord {
+    short id        <bgcolor=cLtGreen, comment="IMAGE_ID">;
+    short featureId <bgcolor=cBlue, comment="IMAGE_FEATURE_ID -- CONFIRMED (92-file empirical corpus): direct 0-based index into this file's FN (feature name) table when one is present (V5+ files) -- IMG[i].featureId == i and FN[i] is exactly that image's human-readable feature name in every CarStatus_Tile-family sample observed. Does NOT reliably reference BTN.id; unrelated to it. V4 files have no FN table, so featureId's target there remains unresolved">;
+    short posX      <bgcolor=cLtGreen, comment="IMAGE_POS_X -- absolute interior-display X coordinate">;
+    short posY      <bgcolor=cLtGreen, comment="IMAGE_POS_Y -- absolute interior-display Y coordinate. Negative values are valid and observed in real data (e.g. posY=-43 recurs across multiple 'Car widget' file variants), representing an icon positioned above the nominal frame origin, not an encoding error">;
+    if (!isMib2)
+        short colored <bgcolor=cLtGreen, comment="IMAGE_COLORED -- 0/1 boolean flag (isImageColored() == (value==1)) -- MIB3 only; absent entirely in MIB2's 4-short record. Observed as always 1 across all 1740 IMG records in the 92-file corpus; the 0 value is legal per the decompiled reader but was never seen in practice">;
+};
+
+// GenericCarAdjusterConstants: BACKGROUND_* field indices. 5 shorts/record
+// in MIB3; MIB2 records are 4 shorts -- they end after posY, with no
+// "scale" field on disk at all.
+struct GCA_BackgroundRecord {
+    short id       <bgcolor=cLtGreen, comment="BACKGROUND_ID">;
+    short aspectId <bgcolor=cRed, comment="BACKGROUND_ASPECT_ID -- cross-reference key, semantic mapping not confirmed. No real-world instances of this field were available to inspect -- the BCKG section was empty (backgroundCount==0) in all 92 files of the empirical corpus">;
+    short posX     <bgcolor=cLtGreen, comment="BACKGROUND_POS_X">;
+    short posY     <bgcolor=cLtGreen, comment="BACKGROUND_POS_Y">;
+    if (!isMib2)
+        short scale <bgcolor=cLtGreen, comment="BACKGROUND_SCALE -- MIB3 only; absent entirely in MIB2's 4-short record">;
+};
+
+// ============================================================
+// SECTION TYPES
+// MIB3: each section = control-flag GCA_String, then a short count, then
+// `count` fixed-size records (for BTN/IMG/BCKG/SVID) or `count` GCA_String
+// entries (for SVN/FN). CI is a single short with no count prefix.
+// MIB2 (BTN/IMG/BCKG only -- see isMib2 above): no control-flag string --
+// each section is just the short count followed directly by its records.
+// ============================================================
+
+// "CI" -- ConfigurationIntentionReader. Present in V5 and V51/52/53, NOT in V4.
+struct GCA_ConfigurationIntention {
+    GCA_String flag <bgcolor=cPurple, read=GcaStringRead, comment="Expected \"CI\"">;
+    GcaCheckFlag(flag, "CI");
+    short configurationIntention <bgcolor=cRed, comment="Single widget-specific intention/mode value; on-disk position confirmed (readConfigurationIntention), real-world meaning/enumeration not confirmed from decompiled code alone">;
+};
+
+// "FGP" -- FeatureGroupPriorityReader. V51/52/53 only.
+struct GCA_FeatureGroupPriority {
+    GCA_String flag <bgcolor=cPurple, read=GcaStringRead, comment="Expected \"FGP\"">;
+    GcaCheckFlag(flag, "FGP");
+    short featureGroupRefCount <bgcolor=cYellow, comment="Number of feature-group IDs that follow">;
+    if (featureGroupRefCount > 0)
+        short featureGroupId[featureGroupRefCount] <bgcolor=cLtGreen, comment="Feature-group IDs, in priority order">;
+};
+
+// "FPWFG" -- FeaturePriorityWithinFeatureGroupReader. V51/52/53 only.
+// Jagged 3D array: outer (per feature group) -> mid (per priority bucket)
+// -> inner (feature IDs in that bucket). Each dimension is independently
+// short-counted, so the array is genuinely ragged, not rectangular.
+struct GCA_FPWFG_Inner {
+    short featureIdRefCount <bgcolor=cYellow, comment="Innermost dimension: number of feature IDs in this (group, priority) bucket">;
+    if (featureIdRefCount > 0)
+        short featureId[featureIdRefCount] <bgcolor=cLtGreen, comment="Feature IDs sharing this priority within this feature group">;
+};
+
+struct GCA_FPWFG_Mid {
+    short priorityCount <bgcolor=cYellow, comment="Mid dimension: number of priority buckets in this feature group">;
+    if (priorityCount > 0)
+        GCA_FPWFG_Inner priority[priorityCount] <optimize=false>;
+};
+
+struct GCA_FeaturePriorityWithinFeatureGroup {
+    GCA_String flag <bgcolor=cPurple, read=GcaStringRead, comment="Expected \"FPWFG\"">;
+    GcaCheckFlag(flag, "FPWFG");
+    short featureGroupRefCount <bgcolor=cYellow, comment="Outer dimension: number of feature groups (should match GCA_FeatureGroupPriority's count, not cross-validated by the Java reader)">;
+    if (featureGroupRefCount > 0)
+        GCA_FPWFG_Mid featureGroup[featureGroupRefCount] <optimize=false>;
+};
+
+// "BTN" -- ButtonDefinitionReader (also reused verbatim, same "BTN" flag
+// string, for the V5/V51-53 "button supplemental" section further down).
+// MIB2 has no control-flag strings at all -- the section is just the
+// short count immediately followed by the records.
+struct GCA_ButtonSection {
+    if (!isMib2) {
+        GCA_String flag <bgcolor=cPurple, read=GcaStringRead, comment="Expected \"BTN\" (both the primary and supplemental button sections use this exact same tag -- they are distinguished only by their position in the file, not by the tag itself). MIB2 only: absent -- section starts directly with buttonCount">;
+        GcaCheckFlag(flag, "BTN");
+    }
+    short buttonCount <bgcolor=cYellow, comment="Number of 21-short button records that follow">;
+    if (buttonCount > 0)
+        GCA_ButtonRecord button[buttonCount] <optimize=false>;
+};
+
+// "IMG" -- ImageDefinitionReader. MIB2: no control-flag string, and
+// records are 4 shorts (see GCA_ImageRecord) instead of 5.
+struct GCA_ImageSection {
+    if (!isMib2) {
+        GCA_String flag <bgcolor=cPurple, read=GcaStringRead, comment="Expected \"IMG\". MIB2 only: absent -- section starts directly with imageCount">;
+        GcaCheckFlag(flag, "IMG");
+    }
+    short imageCount <bgcolor=cYellow, comment="Number of image records that follow (5 shorts each in MIB3, 4 shorts each in MIB2)">;
+    if (imageCount > 0)
+        GCA_ImageRecord image[imageCount] <optimize=false>;
+};
+
+// "BCKG" -- BackgroundDefinitionReader. MIB2: no control-flag string, and
+// records are 4 shorts (see GCA_BackgroundRecord) instead of 5.
+// EMPIRICAL NOTE: this section was empty (backgroundCount==0) in all 92
+// real-world MIB3 files analyzed -- the BCKG mechanism is defined by the
+// format but was not seen populated in this corpus, so real-world BCKG
+// record semantics (in particular BACKGROUND_ASPECT_ID) can't be confirmed
+// from sample data alone.
+struct GCA_BackgroundSection {
+    if (!isMib2) {
+        GCA_String flag <bgcolor=cPurple, read=GcaStringRead, comment="Expected \"BCKG\". MIB2 only: absent -- section starts directly with backgroundCount">;
+        GcaCheckFlag(flag, "BCKG");
+    }
+    short backgroundCount <bgcolor=cYellow, comment="Number of background records that follow (5 shorts each in MIB3, 4 shorts each in MIB2). Empirically always 0 in the 92-file corpus -- BCKG has not been observed populated in real files">;
+    if (backgroundCount > 0)
+        GCA_BackgroundRecord background[backgroundCount] <optimize=false>;
+};
+
+// "SVID" -- SceneViewDefinitionReader. V5 / V51-53 only.
+struct GCA_SceneViewIds {
+    GCA_String flag <bgcolor=cPurple, read=GcaStringRead, comment="Expected \"SVID\"">;
+    GcaCheckFlag(flag, "SVID");
+    short sceneViewCount <bgcolor=cYellow, comment="Number of scene-view IDs that follow">;
+    if (sceneViewCount > 0)
+        short sceneViewId[sceneViewCount] <bgcolor=cLtGreen, comment="Scene view IDs, matched positionally with the names in the following SVN section">;
+};
+
+// "SVN" -- SceneViewNamesReader. V5 / V51-53 only. Its own count is read
+// independently of SVID's count (setSceneViewNames() takes min(SVID.size,
+// SVN.size) when pairing them, so a mismatch is tolerated, not an error).
+struct GCA_SceneViewNames {
+    GCA_String flag <bgcolor=cPurple, read=GcaStringRead, comment="Expected \"SVN\"">;
+    GcaCheckFlag(flag, "SVN");
+    short sceneViewNameCount <bgcolor=cYellow, comment="Number of name strings that follow (paired positionally with SVID's IDs, min(count) wins if they differ)">;
+    if (sceneViewNameCount > 0)
+        GCA_String sceneViewName[sceneViewNameCount] <optimize=false, read=GcaStringRead, bgcolor=cLtGray, comment="Human-readable scene view name">;
+};
+
+// "FN" -- FeatureNamesReader. V5 / V51-53 only.
+struct GCA_FeatureNames {
+    GCA_String flag <bgcolor=cPurple, read=GcaStringRead, comment="Expected \"FN\"">;
+    GcaCheckFlag(flag, "FN");
+    short featureNameCount <bgcolor=cYellow, comment="Number of feature name strings that follow">;
+    if (featureNameCount > 0)
+        GCA_String featureName[featureNameCount] <optimize=false, read=GcaStringRead, bgcolor=cLtGray, comment="Human-readable feature name">;
+};
+
+// ============================================================
+// MAIN PARSE
+// ============================================================
+
+GCA_Header header;
+
+if (header.magic != -310)
+    Warning("GCA: unexpected magic 0x%04X at offset 0 (expected 0xFECA / -310) -- this may not be a .gca file", (ushort)header.magic);
+
+if (header.fileLength != FileSize())
+    Printf("GCA: note -- header-reported fileLength (%d) does not match actual file size (%d); the original Java reader never re-validates this field, so this is informational only.\n",
+        header.fileLength, FileSize());
+
+Printf("=== GCA File ===\nmagic=0x%04X  version=%d  reported_length=%d  actual_size=%d\n",
+    (ushort)header.magic, header.version, header.fileLength, FileSize());
+
+// Sniff MIB2 vs MIB3 right after the header, before any section struct
+// (all of which branch on isMib2) is instantiated below.
+isMib2 = GcaSniffIsMib2();
+if (isMib2)
+    Printf("GCA: format sniff -- offset 0x06 does not decode to a MIB3 control-flag string (\"BTN\"/\"CI\"); parsing as legacy MIB2 (no control-flag strings, 4-short IMG/BCKG records).\n");
+else
+    Printf("GCA: format sniff -- offset 0x06 decodes to a MIB3 control-flag string; parsing as MIB3.\n");
+
+// Version dispatch, mirroring GenericCarAdjusterConfigData#createReader()
+// EXACTLY (an unconditional <= 4 / == 5 / else test, not a {51,52,53} match):
+//   version <= 4  -> V4Reader   (3 sections)
+//   version == 5  -> V5Reader   (8 sections)
+//   version >  5  -> V53Reader  (10 sections; covers 51/52/53 and anything else > 5)
+// MIB2 files use the exact same V4-shaped 3-section body (BTN, IMG, BCKG)
+// regardless of version -- no MIB2 sample with a V5/V51-53-style layout
+// has ever been observed, matching parseGcaMib2() in templates/gca.html.
+if (isMib2) {
+
+    Printf("--- Layout: MIB2 (version %d) -- 3 sections, no control-flag strings ---\n", header.version);
+    if (header.version != 4)
+        Warning("GCA: MIB2 version %d has not been observed before (only version 4 is confirmed) -- parsing with the same BTN/IMG/BCKG layout anyway.", header.version);
+
+    GCA_ButtonSection btn;
+    Printf("[BTN]  %d button record(s)\n", btn.buttonCount);
+    local int biM2;
+    for (biM2 = 0; biM2 < btn.buttonCount; biM2++)
+        Printf("  button[%d] id=%d imagePos=(%d,%d) validCoords=%d aspectId=%d\n",
+            biM2, btn.button[biM2].id, btn.button[biM2].imagePosX, btn.button[biM2].imagePosY,
+            btn.button[biM2].validCoords, btn.button[biM2].aspectId);
+
+    GCA_ImageSection img;
+    Printf("[IMG]  %d image record(s)\n", img.imageCount);
+    local int iiM2;
+    for (iiM2 = 0; iiM2 < img.imageCount; iiM2++)
+        Printf("  image[%d] id=%d featureId=%d pos=(%d,%d)\n",
+            iiM2, img.image[iiM2].id, img.image[iiM2].featureId, img.image[iiM2].posX,
+            img.image[iiM2].posY);
+
+    GCA_BackgroundSection bckg;
+    Printf("[BCKG] %d background record(s)\n", bckg.backgroundCount);
+    local int bgiM2;
+    for (bgiM2 = 0; bgiM2 < bckg.backgroundCount; bgiM2++)
+        Printf("  background[%d] id=%d aspectId=%d pos=(%d,%d)\n",
+            bgiM2, bckg.background[bgiM2].id, bckg.background[bgiM2].aspectId,
+            bckg.background[bgiM2].posX, bckg.background[bgiM2].posY);
+
+} else if (header.version <= 4) {
+
+    Printf("--- Layout: V4 (version %d, <=4) -- 3 sections ---\n", header.version);
+
+    GCA_ButtonSection btn;
+    Printf("[BTN]  %d button record(s)\n", btn.buttonCount);
+    local int bi;
+    for (bi = 0; bi < btn.buttonCount; bi++)
+        Printf("  button[%d] id=%d imagePos=(%d,%d) validCoords=%d aspectId=%d\n",
+            bi, btn.button[bi].id, btn.button[bi].imagePosX, btn.button[bi].imagePosY,
+            btn.button[bi].validCoords, btn.button[bi].aspectId);
+
+    GCA_ImageSection img;
+    Printf("[IMG]  %d image record(s)\n", img.imageCount);
+    local int ii;
+    for (ii = 0; ii < img.imageCount; ii++)
+        Printf("  image[%d] id=%d featureId=%d pos=(%d,%d) colored=%d\n",
+            ii, img.image[ii].id, img.image[ii].featureId, img.image[ii].posX,
+            img.image[ii].posY, img.image[ii].colored);
+
+    GCA_BackgroundSection bckg;
+    Printf("[BCKG] %d background record(s)\n", bckg.backgroundCount);
+    local int bgi;
+    for (bgi = 0; bgi < bckg.backgroundCount; bgi++)
+        Printf("  background[%d] id=%d aspectId=%d pos=(%d,%d) scale=%d\n",
+            bgi, bckg.background[bgi].id, bckg.background[bgi].aspectId,
+            bckg.background[bgi].posX, bckg.background[bgi].posY, bckg.background[bgi].scale);
+
+} else if (header.version == 5) {
+
+    Printf("--- Layout: V5 (version %d) -- 8 sections ---\n", header.version);
+
+    GCA_ConfigurationIntention ci;
+    Printf("[CI]   configurationIntention=%d\n", ci.configurationIntention);
+
+    GCA_ButtonSection btn;
+    Printf("[BTN]  %d button record(s)\n", btn.buttonCount);
+    local int bi5;
+    for (bi5 = 0; bi5 < btn.buttonCount; bi5++)
+        Printf("  button[%d] id=%d imagePos=(%d,%d) validCoords=%d aspectId=%d\n",
+            bi5, btn.button[bi5].id, btn.button[bi5].imagePosX, btn.button[bi5].imagePosY,
+            btn.button[bi5].validCoords, btn.button[bi5].aspectId);
+
+    GCA_ImageSection img;
+    Printf("[IMG]  %d image record(s)\n", img.imageCount);
+    local int ii5;
+    for (ii5 = 0; ii5 < img.imageCount; ii5++)
+        Printf("  image[%d] id=%d featureId=%d pos=(%d,%d) colored=%d\n",
+            ii5, img.image[ii5].id, img.image[ii5].featureId, img.image[ii5].posX,
+            img.image[ii5].posY, img.image[ii5].colored);
+
+    GCA_BackgroundSection bckg;
+    Printf("[BCKG] %d background record(s)\n", bckg.backgroundCount);
+    local int bg5;
+    for (bg5 = 0; bg5 < bckg.backgroundCount; bg5++)
+        Printf("  background[%d] id=%d aspectId=%d pos=(%d,%d) scale=%d\n",
+            bg5, bckg.background[bg5].id, bckg.background[bg5].aspectId,
+            bckg.background[bg5].posX, bckg.background[bg5].posY, bckg.background[bg5].scale);
+
+    // EMPIRICAL NOTE: buttonCount was 0 in all 40 real-world V5 files
+    // analyzed -- this supplemental button mechanism is defined by the
+    // format but appears unused in practice across the observed corpus.
+    GCA_ButtonSection btnSupplemental;
+    Printf("[BTN]  %d supplemental button record(s)\n", btnSupplemental.buttonCount);
+    local int bs5;
+    for (bs5 = 0; bs5 < btnSupplemental.buttonCount; bs5++)
+        Printf("  buttonSupplemental[%d] id=%d imagePos=(%d,%d) validCoords=%d aspectId=%d\n",
+            bs5, btnSupplemental.button[bs5].id, btnSupplemental.button[bs5].imagePosX,
+            btnSupplemental.button[bs5].imagePosY, btnSupplemental.button[bs5].validCoords,
+            btnSupplemental.button[bs5].aspectId);
+
+    GCA_SceneViewIds svid;
+    Printf("[SVID] %d scene view id(s)\n", svid.sceneViewCount);
+
+    GCA_SceneViewNames svn;
+    Printf("[SVN]  %d scene view name(s)\n", svn.sceneViewNameCount);
+    local int sv5;
+    for (sv5 = 0; sv5 < svn.sceneViewNameCount; sv5++)
+        Printf("  sceneView[%d] id=%d name=\"%s\"\n",
+            sv5, (sv5 < svid.sceneViewCount) ? svid.sceneViewId[sv5] : -1,
+            GcaStringRead(svn.sceneViewName[sv5]));
+
+    GCA_FeatureNames fn;
+    Printf("[FN]   %d feature name(s)\n", fn.featureNameCount);
+    local int fn5;
+    for (fn5 = 0; fn5 < fn.featureNameCount; fn5++)
+        Printf("  featureName[%d] = \"%s\"\n", fn5, GcaStringRead(fn.featureName[fn5]));
+
+} else {
+
+    // version > 5 -- covers 51, 52, 53, and (per the decompiled else-branch)
+    // any other value greater than 5.
+    Printf("--- Layout: V51/52/53 (version %d, >5) -- 10 sections ---\n", header.version);
+    if (header.version != 51 && header.version != 52 && header.version != 53)
+        Warning("GCA: version %d is not one of the known 51/52/53 constants, but the decompiled reader dispatch (else branch, version > 5) uses this 10-section layout for it anyway.", header.version);
+
+    GCA_ConfigurationIntention ci;
+    Printf("[CI]    configurationIntention=%d\n", ci.configurationIntention);
+
+    GCA_FeatureGroupPriority fgp;
+    Printf("[FGP]   %d feature group id(s)\n", fgp.featureGroupRefCount);
+
+    GCA_FeaturePriorityWithinFeatureGroup fpwfg;
+    Printf("[FPWFG] %d feature group(s) in jagged priority table\n", fpwfg.featureGroupRefCount);
+
+    GCA_ButtonSection btn;
+    Printf("[BTN]   %d button record(s)\n", btn.buttonCount);
+    local int bi53;
+    for (bi53 = 0; bi53 < btn.buttonCount; bi53++)
+        Printf("  button[%d] id=%d imagePos=(%d,%d) validCoords=%d aspectId=%d\n",
+            bi53, btn.button[bi53].id, btn.button[bi53].imagePosX, btn.button[bi53].imagePosY,
+            btn.button[bi53].validCoords, btn.button[bi53].aspectId);
+
+    GCA_ImageSection img;
+    Printf("[IMG]   %d image record(s)\n", img.imageCount);
+    local int ii53;
+    for (ii53 = 0; ii53 < img.imageCount; ii53++)
+        Printf("  image[%d] id=%d featureId=%d pos=(%d,%d) colored=%d\n",
+            ii53, img.image[ii53].id, img.image[ii53].featureId, img.image[ii53].posX,
+            img.image[ii53].posY, img.image[ii53].colored);
+
+    GCA_BackgroundSection bckg;
+    Printf("[BCKG]  %d background record(s)\n", bckg.backgroundCount);
+    local int bg53;
+    for (bg53 = 0; bg53 < bckg.backgroundCount; bg53++)
+        Printf("  background[%d] id=%d aspectId=%d pos=(%d,%d) scale=%d\n",
+            bg53, bckg.background[bg53].id, bckg.background[bg53].aspectId,
+            bckg.background[bg53].posX, bckg.background[bg53].posY, bckg.background[bg53].scale);
+
+    // EMPIRICAL NOTE: see the V5 branch above -- this supplemental button
+    // mechanism was observed empty (buttonCount==0) in every V5 file in
+    // the 92-file corpus; no V51/52/53 sample with a populated
+    // supplemental BTN section was found either.
+    GCA_ButtonSection btnSupplemental;
+    Printf("[BTN]   %d supplemental button record(s)\n", btnSupplemental.buttonCount);
+    local int bs53;
+    for (bs53 = 0; bs53 < btnSupplemental.buttonCount; bs53++)
+        Printf("  buttonSupplemental[%d] id=%d imagePos=(%d,%d) validCoords=%d aspectId=%d\n",
+            bs53, btnSupplemental.button[bs53].id, btnSupplemental.button[bs53].imagePosX,
+            btnSupplemental.button[bs53].imagePosY, btnSupplemental.button[bs53].validCoords,
+            btnSupplemental.button[bs53].aspectId);
+
+    GCA_SceneViewIds svid;
+    Printf("[SVID]  %d scene view id(s)\n", svid.sceneViewCount);
+
+    GCA_SceneViewNames svn;
+    Printf("[SVN]   %d scene view name(s)\n", svn.sceneViewNameCount);
+    local int sv53;
+    for (sv53 = 0; sv53 < svn.sceneViewNameCount; sv53++)
+        Printf("  sceneView[%d] id=%d name=\"%s\"\n",
+            sv53, (sv53 < svid.sceneViewCount) ? svid.sceneViewId[sv53] : -1,
+            GcaStringRead(svn.sceneViewName[sv53]));
+
+    GCA_FeatureNames fn;
+    Printf("[FN]    %d feature name(s)\n", fn.featureNameCount);
+    local int fn53;
+    for (fn53 = 0; fn53 < fn.featureNameCount; fn53++)
+        Printf("  featureName[%d] = \"%s\"\n", fn53, GcaStringRead(fn.featureName[fn53]));
+}
+
+// ============================================================
+// TRAILING BYTES
+// The decompiled reader stops exactly where the last section ends -- there
+// is no footer, checksum, or padding in this format. Any bytes left over
+// are either a parsing desync (wrong version dispatch, corrupt counts) or
+// data this template doesn't know about yet.
+// ============================================================
+local quad consumed = FTell();
+local quad remaining = FileSize() - consumed;
+if (remaining > 0) {
+    Warning("GCA: %d unparsed trailing byte(s) after the last known section (consumed 0x%x of 0x%x) -- likely wrong version dispatch or an unrecognized trailing structure.", remaining, consumed, FileSize());
+    uchar trailingData[remaining] <bgcolor=cRed, comment="Unparsed trailing bytes">;
+} else if (remaining < 0) {
+    Warning("GCA: parsing overran the end of the file by %d byte(s) -- a count field was likely misread.", -remaining);
+}
+
+Printf("=== End of GCA parse -- consumed 0x%x of 0x%x byte(s) ===\n", consumed, FileSize());
