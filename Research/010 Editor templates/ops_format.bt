@@ -1,0 +1,552 @@
+//--------------------------------------
+//--- 010 Editor v14.0 Binary Template
+//
+// File:        ops_format.bt
+// Author:      Jille
+// Revision:    1.0
+// Purpose:     MIB3 Optical Parking System (OPS) binary config file parser
+//              for config.ops / config_mini.ops. These files describe the
+//              360/parking-assist HMI's camera mirroring correction, park-
+//              track geometry, top-down "area view" background, per-segment
+//              distance-band graphics, and car/trailer overlay image
+//              positions used by the parking-assist rendering widget.
+//              Fixed-size, fixed-offset layout -- exactly 8244 bytes, no
+//              length-prefixed/variable sections anywhere in the format.
+//
+// ------------------------------------------------------------------------
+// Primitive encoding: every multi-byte value in this format is a 16-bit
+// signed little-endian integer (int16 / short). There are no 8/32/64-bit
+// fields, no strings, and no zlib/compressed regions anywhere in the file.
+//
+// Top-level layout (offsets are absolute from the start of the file):
+//   +0x0000 (2 bytes)  magic     int16 LE, must equal -310 (0xFECA as raw
+//                                 bytes CA FE) -- same magic constant as
+//                                 the unrelated .gca format (both are MIB3
+//                                 config-file families that happen to share
+//                                 this header convention)
+//   +0x0002 (2 bytes)  version   int16 LE, expected 70; anything below the
+//                                 observed minimum of 55 is treated as
+//                                 implausible / unsupported by the source
+//                                 tool and disables structured parsing
+//   +0x0004 .. +0x2033             9 further fixed-offset sections, listed
+//                                 below in on-disk order. All of them are
+//                                 contiguous and their lengths sum exactly
+//                                 to 8244 (= TOTAL_SIZE_EXPECTED), so there
+//                                 is no gap/padding *between* sections --
+//                                 any "extra" bytes noted below are WITHIN
+//                                 a section, after its documented record
+//                                 table, not between sections.
+//
+//   Section            Offset   Length  Declared shape
+//   -----------------  -------  ------  --------------------------------
+//   header             0x0004   1024 B  512x int16, NO known per-field
+//                                       layout (reserved/padding region)
+//   mirrorData         0x0404      8 B  4x int16 named fields
+//   imageMetaData      0x040C      2 B  1x int16 named field
+//   trackData          0x040E     24 B  12x int16 (11 named + 1 unmapped)
+//   areaViewData       0x0426   2014 B  1007x int16, NO confirmed per-
+//                                       field layout (raw values only)
+//   segmentData        0x0C04   4096 B  98 records x 12 int16 fields
+//                                       (= 2352 of the 4096 bytes; the
+//                                       remaining 1744 bytes are trailing/
+//                                       unaccounted-for, see PADDING note)
+//   additionalGraphics 0x1C04   1024 B  44 records x 10 int16 fields
+//                                       (= 880 of the 1024 bytes; 144
+//                                       bytes trailing, see PADDING note)
+//   carSpecificImageData 0x2004   24 B  2 records x 3 int16 fields
+//                                       (= 12 of the 24 bytes; 12 bytes
+//                                       trailing, see PADDING note)
+//   trailerImageData     0x201C   24 B  2 records x 5 int16 fields
+//                                       (= 20 of the 24 bytes; 4 bytes
+//                                       trailing, see PADDING note)
+//
+// PADDING note: for every record-array section above where
+// (declaredRows * fieldCount * 2) is smaller than the section's declared
+// byte length, the leftover bytes are classified as either confirmed
+// "0xFFFF sentinel padding" (if every leftover int16
+// value is exactly -1) or as unstructured "unaccounted-for trailing
+// bytes" otherwise. This template mirrors that distinction: each trailing
+// region below is read as a plain short[] and a helper function reports
+// via Printf() whether it matches the all -1 sentinel pattern observed in
+// real samples, WITHOUT asserting that pattern as a hard rule (a file
+// could legally differ).
+//
+// areaViewData note: this section appears to contain approximately 25
+// conceptual entries (background positions/insets for front/left/rear/
+// right + 4 area-button positions/offsets) but 25 does not evenly divide
+// 1007 int16 values, so no per-entry field boundary is asserted anywhere
+// -- including here. The 1007 values are exposed as a flat raw array only.
+//
+// trackData note: the spec text names 11 quantities (start XY, front axle
+// XY, rear axle XY, L/R offset, front-to-front, corner, overhang) but the
+// section holds 12 int16 values. The 12th slot's mapping is unconfirmed
+// and is exposed here as "unmapped11".
+//
+// "name" fields (segmentData has none; additionalGraphics / carSpecific-
+// ImageData / trailerImageData each have one per record): on-disk these
+// are plain int16 values, NOT length-prefixed strings. Despite the field
+// name, its meaning is not confirmed: it may be a resource/texture id,
+// an internal graphic-name enum,
+// or something else -- kept cRed accordingly.
+//
+// Color coding (matches the convention used by docs/gca_format.bt):
+//   cLtGreen = On-disk offset/type and documented field name are both
+//              considered high-confidence for this format, but note
+//              the whole-format caveat above: this is reverse-engineered
+//              from samples, not decompiled source, so even cLtGreen
+//              fields here are one confidence tier below cLtGreen in
+//              docs/gca_format.bt.
+//   cYellow  = Structural/padding region -- present and byte-accurate,
+//              but not itself meaningful "data" (trailing padding shorts
+//              after a record table).
+//   cRed     = On-disk position/type is certain (it's inside a section
+//              whose length and record shape are documented), but the
+//              real-world *meaning* of the value is unconfirmed --
+//              "name" fields, trackData.unmapped11, inset.
+//   cSilver  = Entirely undocumented reserved region (the 1024-byte
+//              "header" section) and the unstructured 1007-value
+//              "areaViewData" blob -- byte-accurate position only.
+//--------------------------------------
+
+LittleEndian();
+
+// ============================================================
+// FILE HEADER (offsets 0x0000-0x0003)
+// ============================================================
+local short OPS_MAGIC_EXPECTED   = -310; // 0xFECA
+local short OPS_VERSION_EXPECTED = 70;
+local short OPS_VERSION_MIN      = 55;
+local int   OPS_TOTAL_SIZE_EXPECTED = 8244;
+
+// ============================================================
+// ENUMS (semantic reference, from decompiled MIB3 OPSConstants and
+// related Java classes -- NOT confirmed to be stored anywhere in the
+// on-disk config.ops / config_mini.ops layout documented in this file.
+// config.ops is purely static HMI layout/geometry data (mirror
+// correction, track geometry, segment graphics, image positions); these
+// state enums describe RUNTIME warning/assist levels the parking-assist
+// system computes from live sensor data. They are included here as
+// reference documentation because they share the OPS ("Optical Parking
+// System") namespace and because segmentData.sector_id (see
+// OPS_SegmentRecord below) uses the companion SensorZoneID enum further
+// down. No field in this binary format is currently known to hold a
+// PDCState / RTAFTAState / ManeuverAssistState / RimProtectionState
+// value -- treat these as background knowledge, not a parsed field type.
+//
+// NOTE on naming: in the decompiled Java, each of these is a small
+// nested/standalone class of `int` constants (e.g. OPSConstants.PDCState
+// .NOWARNING, OPSConstants.RTAFTAState.NOWARNING, ...), so identical
+// names (NOWARNING, OFF, ERROR, LOW, HARD, ...) can coexist across the
+// four groups without colliding -- Java scopes them per class. 010
+// Editor enum members share ONE flat/global namespace, so the same names
+// re-declared across multiple enum{} blocks below would fail to compile
+// (redefinition error). Each enumerator here is therefore prefixed with
+// its group (PDC_ / RTAFTA_ / MANEUVER_ / RIM_); the suffix after the
+// prefix is the original decompiled constant name unchanged.
+// ============================================================
+
+// Park Distance Control (PDC) warning level, per front/rear/side zone.
+// NOWARNING/LOW/MEDIUM/HARD are the normal escalating warning stages;
+// the _NOT_INIT variants mirror LOW/MEDIUM/HARD but additionally signal
+// the zone hasn't finished sensor initialization yet.
+typedef enum <int> {
+    PDC_NOWARNING         = 0,
+    PDC_LOW               = 1,
+    PDC_MEDIUM            = 2,
+    PDC_HARD              = 3,
+    PDC_LOW_NOT_INIT      = 6,
+    PDC_MEDIUM_NOT_INIT   = 7,
+    PDC_HARD_NOT_INIT     = 8,
+    PDC_AFFECTEDBYFAILURE = 12,
+    PDC_TEMPNOTAVAILABLE  = 13,
+    PDC_NOTINITIALIZED    = 14,
+    PDC_ERROR             = 15
+} PDCState;
+
+// Rear/Front Traffic Alert (RTA/FTA) warning level -- cross-traffic
+// detection while reversing/pulling out of a parking space.
+typedef enum <int> {
+    RTAFTA_OFF       = 0,
+    RTAFTA_NOWARNING = 1,
+    RTAFTA_LOW       = 2,
+    RTAFTA_HARD      = 3,
+    RTAFTA_ERROR     = 15
+} RTAFTAState;
+
+// Maneuver assist state (e.g. active steering/trailer maneuver guidance).
+typedef enum <int> {
+    MANEUVER_OFF       = 0,
+    MANEUVER_NOWARNING = 1,
+    MANEUVER_WARNING   = 2,
+    MANEUVER_ERROR     = 15
+} ManeuverAssistState;
+
+// Rim protection (curb/kerb strike warning) state.
+typedef enum <int> {
+    RIM_OFF          = 0,
+    RIM_LOW          = 1,
+    RIM_HIGH         = 2,
+    RIM_NOTDISPLAYED = 14,
+    RIM_ERROR        = 15
+} RimProtectionState;
+
+// ============================================================
+// SENSOR ZONE MAPPING
+//
+// File sector IDs -- these are the values expected in
+// OPS_SegmentRecord.sector_id (segmentData, see below). The Java
+// constants are byte-sized (0-82 observed range), so they are declared
+// here as <uchar>; on disk, segmentData.sector_id is stored as a full
+// int16 (see the primitive-encoding note at the top of this file), so
+// only the low byte is expected to be meaningful -- this enum is
+// reference documentation for interpreting that field's value, it is
+// NOT applied directly as the field's type (a 1-byte enum can't be
+// layered onto a 2-byte field without desyncing the struct).
+//
+// Naming pattern (best-effort reading of the abbreviations): V/H = front
+// vertical/horizontal-ish grouping vs. rear (mirrored with R prefix in
+// the 8-15 block), L/R = left/right, S = side, M = middle/main, A =
+// assist/auxiliary, X = extended range, CB = curb/corner-bumper variant,
+// RO = rear-only/rotated variant, TAL = traffic-alert lateral zone.
+// ============================================================
+typedef enum <uchar> {
+    SECID_VLM      = 0,   SECID_VLA      = 1,   SECID_LSV     = 2,   SECID_LSVM    = 3,
+    SECID_LSHM     = 4,   SECID_LSH      = 5,   SECID_HLA     = 6,   SECID_HLM     = 7,
+    SECID_VRM      = 8,   SECID_VRA      = 9,   SECID_RSV     = 10,  SECID_RSVM    = 11,
+    SECID_RSHM     = 12,  SECID_RSH      = 13,  SECID_HRA     = 14,  SECID_HRM     = 15,
+    SECID_HLARO    = 16,  SECID_HLMRO    = 17,  SECID_VLAX    = 20,  SECID_HLAX    = 21,
+    SECID_RTAL     = 24,  SECID_RTALX    = 26,  SECID_VLAX_CB = 44,  SECID_HLAX_CB = 45,
+    SECID_RTALRO   = 48,  SECID_FTAL     = 50,  SECID_FTALX   = 52
+} SensorZoneID;
+
+// ============================================================
+// ADDITIONAL SEMANTIC NOTES (from decompiled OPS display/vehicle-geometry
+// classes). None of the items below are mapped to a confirmed byte
+// offset in this file -- they are documented here so they aren't
+// rediscovered/mis-attributed later, and to give context for fields that
+// ARE mapped (trackData, the "inset"/"name" fields, etc.).
+//
+// --- Display mode flags -------------------------------------------
+//   direction     -- selects which camera/maneuver direction the widget
+//                     is laid out for (front vs. rear parking). Likely
+//                     governs which mirrorData pair (front vs. the _RO
+//                     "rear/other" pair) and which trackData axle (front
+//                     vs. rear) is treated as the "leading" edge.
+//   showRearOnly  -- when set, only rear-side sensor zones (the
+//                     SECID_VR*/SECID_RS*/SECID_HR* group above) are
+//                     rendered; front zones are suppressed even if
+//                     present in segmentData.
+//   showTrailer   -- enables rendering of trailerImageData's overlay
+//                     image(s) and rotation-center indicator instead of
+//                     (or in addition to) carSpecificImageData's plain
+//                     car overlay.
+//   (etc. -- a front-only counterpart to showRearOnly and an area-view
+//   toggle are expected to exist alongside these but were not
+//   individually confirmed by name). None of these flags have a known
+//   offset; the most plausible location is somewhere inside the
+//   1024-byte OPS_ReservedHeader region below, since that is the only
+//   remaining section large enough to hold a handful of small
+//   integer/boolean settings that aren't part of any of the 8 other,
+//   already record-shaped sections.
+//
+// --- Vehicle calibration semantics ---------------------------------
+//   wheelBase    -- distance between front and rear axle centers. For a
+//                    given vehicle this should be consistent with the
+//                    longitudinal separation implied by
+//                    trackData.frontAxleY vs. trackData.rearAxleY.
+//   radiusFront  -- turning radius at the front axle/outer front wheel;
+//                    used at runtime (not stored statically here) to
+//                    draw a steering-angle-dependent curved guide line
+//                    on top of the static trackData geometry.
+//   radiusRear   -- turning radius at the rear axle; same purpose as
+//                    radiusFront but for the rear guide line (relevant
+//                    on MQB variants with optional rear-axle steering).
+//   These three are vehicle-specific calibration constants supplied to
+//   the OPS widget from vehicle coding data rather than being stored
+//   inside config.ops itself -- trackData below instead stores already-
+//   resolved pixel/geometry positions derived from them, not the raw
+//   radii/wheelbase.
+//
+// --- Unknown / unconfirmed fields (consolidated) --------------------
+//   inset         -- OPS_SegmentRecord field 7 / OPS_GraphicsRecord
+//                     field 5. Position on-disk is certain; meaning is
+//                     not -- best guess is a border/margin inset in
+//                     pixels applied when compositing the record's
+//                     texture-atlas rectangle onto the widget, by
+//                     analogy with typical UI-compositing fields, not a
+//                     confirmed decompile finding.
+//   name          -- OPS_GraphicsRecord / OPS_CarImageRecord /
+//                     OPS_TrailerImageRecord field 0. Plain int16, NOT a
+//                     length-prefixed string despite the field name.
+//                     Candidates: a resource/texture id, or an internal
+//                     graphic-name enum constant -- no enum matching
+//                     this value range was identified in the decompiled
+//                     classes reviewed so far.
+//   showTestMode  -- identified by name only (a diagnostic/test-pattern
+//                     display toggle, by analogy with similar "test
+//                     mode" flags elsewhere in MIB3 HMI configs); not
+//                     mapped to any byte offset in config.ops -- most
+//                     likely a runtime-only / coding-byte flag rather
+//                     than something persisted in this file at all.
+// ============================================================
+
+struct OPS_FileHeader {
+    short magic   <bgcolor=cLtGreen, comment="Must equal -310 / 0xFECA (raw bytes CA FE). Same magic constant as the unrelated .gca format">;
+    short version <bgcolor=cLtGreen, comment="Expected 70; values below 55 are treated as implausible or unsupported">;
+};
+
+// ============================================================
+// PADDING / TRAILING-BYTES HELPER
+//
+// leftover bytes after a section's documented record table are reported
+// as a confirmed sentinel-padding region only if EVERY leftover int16
+// value is exactly -1 (0xFFFF); otherwise they're just unstructured
+// trailing data. Never treated as an error either way -- purely
+// informational only.
+// ============================================================
+void OpsReportPadding(string label, short arr[], int count) {
+    local int i;
+    local int nonSentinel = 0;
+    if (count <= 0) return;
+    for (i = 0; i < count; i++)
+        if (arr[i] != -1) nonSentinel++;
+    if (nonSentinel == 0)
+        Printf("  %s: %d int16 trailing value(s), all -1 / 0xFFFF -- matches the sentinel-padding pattern observed in real samples\n", label, count);
+    else
+        Printf("  %s: %d int16 trailing value(s), %d of which are NOT -1/0xFFFF -- structure/meaning unconfirmed (see PADDING note in the header comment)\n", label, count, nonSentinel);
+}
+
+// ============================================================
+// SECTION 1: header (offset 0x0004, 1024 bytes / 512x int16)
+// Entirely reserved/undocumented -- no known per-field layout.
+// ============================================================
+struct OPS_ReservedHeader {
+    short raw[512] <bgcolor=cSilver, comment="Reserved region, offset 0x0004-0x0403. No known per-field layout -- exposed as a flat raw int16 array only">;
+};
+
+// ============================================================
+// SECTION 2: mirrorData (offset 0x0404, 8 bytes / 4x int16)
+// Camera-mirroring correction values, front-camera (live) and rear-camera
+// (RO = "rear/other"?) pair.
+// ============================================================
+struct OPS_MirrorData {
+    short mirrorAxisY          <bgcolor=cLtGreen, comment="MIRROR_FIELDS[0]">;
+    short mirrorCorrection     <bgcolor=cLtGreen, comment="MIRROR_FIELDS[1]">;
+    short mirrorAxisY_RO       <bgcolor=cLtGreen, comment="MIRROR_FIELDS[2]">;
+    short mirrorCorrection_RO  <bgcolor=cLtGreen, comment="MIRROR_FIELDS[3]">;
+};
+
+// ============================================================
+// SECTION 3: imageMetaData (offset 0x040C, 2 bytes / 1x int16)
+// ============================================================
+struct OPS_ImageMetaData {
+    short backgroundAlpha <bgcolor=cLtGreen, comment="IMAGEMETA_FIELDS[0]">;
+};
+
+// ============================================================
+// SECTION 4: trackData (offset 0x040E, 24 bytes / 12x int16)
+// Park-track / vehicle geometry reference points used to position the
+// car/trailer overlay images.
+// ============================================================
+struct OPS_TrackData {
+    short startX        <bgcolor=cLtGreen, comment="TRACK_FIELDS[0]">;
+    short startY         <bgcolor=cLtGreen, comment="TRACK_FIELDS[1]">;
+    short frontAxleX      <bgcolor=cLtGreen, comment="TRACK_FIELDS[2]">;
+    short frontAxleY      <bgcolor=cLtGreen, comment="TRACK_FIELDS[3]">;
+    short rearAxleX       <bgcolor=cLtGreen, comment="TRACK_FIELDS[4]">;
+    short rearAxleY       <bgcolor=cLtGreen, comment="TRACK_FIELDS[5]">;
+    short lOffset         <bgcolor=cLtGreen, comment="TRACK_FIELDS[6]">;
+    short rOffset         <bgcolor=cLtGreen, comment="TRACK_FIELDS[7]">;
+    short frontToFront    <bgcolor=cLtGreen, comment="TRACK_FIELDS[8]">;
+    short corner          <bgcolor=cLtGreen, comment="TRACK_FIELDS[9]">;
+    short overhang        <bgcolor=cLtGreen, comment="TRACK_FIELDS[10]">;
+    short unmapped11      <bgcolor=cRed, comment="TRACK_FIELDS[11] -- the spec text only names 11 quantities but this section holds 12 int16 values; this 12th slot's mapping to the spec text is unconfirmed">;
+};
+
+// ============================================================
+// SECTION 5: areaViewData (offset 0x0426, 2014 bytes / 1007x int16)
+// Documented as ~25 conceptual entries (background positions/insets for
+// front/left/rear/right + 4 area-button positions/offsets), but 25 does
+// not evenly divide 1007 values -- exact per-entry field boundaries are
+// unconfirmed, so this is exposed as a flat raw array only.
+// ============================================================
+struct OPS_AreaViewData {
+    short raw[1007] <bgcolor=cSilver, comment="Top-down 'area view' background layout data. Conceptually approximately 25 entries (front/left/rear/right background positions+insets, 4 area-button positions+offsets), but that count does not evenly divide 1007 int16 values -- per-entry field boundaries unconfirmed">;
+};
+
+// ============================================================
+// SECTION 6: segmentData (offset 0x0C04, 4096 bytes)
+// 98 records x 12 int16 fields = 2352 of the 4096 bytes; remaining 1744
+// bytes (872x int16) are trailing/unaccounted-for (see PADDING note).
+// Per-distance-band parking-assist graphic overlay geometry + texture
+// atlas coordinates.
+// ============================================================
+struct OPS_SegmentRecord {
+    short sector_id    <bgcolor=cLtGreen, comment="SEGMENT_FIELDS[0]. Expected to hold a SensorZoneID value (see SECID_* enum above) in its low byte">;
+    short segment_id    <bgcolor=cLtGreen, comment="SEGMENT_FIELDS[1]">;
+    short distance       <bgcolor=cLtGreen, comment="SEGMENT_FIELDS[2]">;
+    short xpos            <bgcolor=cLtGreen, comment="SEGMENT_FIELDS[3]">;
+    short ypos            <bgcolor=cLtGreen, comment="SEGMENT_FIELDS[4]">;
+    short width           <bgcolor=cLtGreen, comment="SEGMENT_FIELDS[5]">;
+    short height          <bgcolor=cLtGreen, comment="SEGMENT_FIELDS[6]">;
+    short inset           <bgcolor=cRed,     comment="SEGMENT_FIELDS[7] -- on-disk position/type certain, real-world meaning (e.g. border-inset in pixels?) unconfirmed">;
+    short tex_x            <bgcolor=cLtGreen, comment="SEGMENT_FIELDS[8]">;
+    short tex_y            <bgcolor=cLtGreen, comment="SEGMENT_FIELDS[9]">;
+    short tex_width        <bgcolor=cLtGreen, comment="SEGMENT_FIELDS[10]">;
+    short tex_height       <bgcolor=cLtGreen, comment="SEGMENT_FIELDS[11]">;
+};
+
+struct OPS_SegmentData {
+    OPS_SegmentRecord record[98] <optimize=false, comment="SEGMENT_ROWS_DECLARED = 98">;
+    short padding[872] <bgcolor=cYellow, comment="Trailing bytes after the 98x12 documented record table (4096 - 98*12*2 = 1744 bytes = 872x int16). See PADDING note in header comment">;
+};
+
+// ============================================================
+// SECTION 7: additionalGraphics (offset 0x1C04, 1024 bytes)
+// 44 records x 10 int16 fields = 880 of the 1024 bytes; remaining 144
+// bytes (72x int16) are trailing/unaccounted-for (see PADDING note).
+// Extra overlay graphics (e.g. area-view buttons) rendered as rectangles
+// at (xpos, ypos) sized (width, height).
+// ============================================================
+struct OPS_GraphicsRecord {
+    short name       <bgcolor=cRed,     comment="GRAPHICS_FIELDS[0] -- plain int16, NOT a length-prefixed string despite the field name; on-disk position certain, real-world meaning (resource id? internal enum?) unconfirmed">;
+    short xpos         <bgcolor=cLtGreen, comment="GRAPHICS_FIELDS[1]. (0,0) is treated as unset/padding rather than a real position">;
+    short ypos         <bgcolor=cLtGreen, comment="GRAPHICS_FIELDS[2]. (0,0) is treated as unset/padding rather than a real position">;
+    short width        <bgcolor=cLtGreen, comment="GRAPHICS_FIELDS[3]">;
+    short height        <bgcolor=cLtGreen, comment="GRAPHICS_FIELDS[4]">;
+    short inset         <bgcolor=cRed,     comment="GRAPHICS_FIELDS[5] -- on-disk position/type certain, real-world meaning unconfirmed">;
+    short tex_x          <bgcolor=cLtGreen, comment="GRAPHICS_FIELDS[6]">;
+    short tex_y          <bgcolor=cLtGreen, comment="GRAPHICS_FIELDS[7]">;
+    short tex_width      <bgcolor=cLtGreen, comment="GRAPHICS_FIELDS[8]">;
+    short tex_height     <bgcolor=cLtGreen, comment="GRAPHICS_FIELDS[9]">;
+};
+
+struct OPS_AdditionalGraphics {
+    OPS_GraphicsRecord record[44] <optimize=false, comment="GRAPHICS_ROWS_DECLARED = 44">;
+    short padding[72] <bgcolor=cYellow, comment="Trailing bytes after the 44x10 documented record table (1024 - 44*10*2 = 144 bytes = 72x int16). See PADDING note in header comment">;
+};
+
+// ============================================================
+// SECTION 8: carSpecificImageData (offset 0x2004, 24 bytes)
+// 2 records x 3 int16 fields = 12 of the 24 bytes; remaining 12 bytes
+// (6x int16) are trailing/unaccounted-for (see PADDING note).
+// Car overlay image position(s).
+// ============================================================
+struct OPS_CarImageRecord {
+    short name <bgcolor=cRed,     comment="CARIMG_FIELDS[0] -- plain int16, NOT a length-prefixed string despite the field name; on-disk position certain, real-world meaning unconfirmed">;
+    short xpos  <bgcolor=cLtGreen, comment="CARIMG_FIELDS[1]. (0,0) is treated as unset/padding">;
+    short ypos  <bgcolor=cLtGreen, comment="CARIMG_FIELDS[2]. (0,0) is treated as unset/padding">;
+};
+
+struct OPS_CarSpecificImageData {
+    OPS_CarImageRecord record[2] <optimize=false, comment="CARIMG_ROWS_DECLARED = 2">;
+    short padding[6] <bgcolor=cYellow, comment="Trailing bytes after the 2x3 documented record table (24 - 2*3*2 = 12 bytes = 6x int16). See PADDING note in header comment">;
+};
+
+// ============================================================
+// SECTION 9: trailerImageData (offset 0x201C, 24 bytes)
+// 2 records x 5 int16 fields = 20 of the 24 bytes; remaining 4 bytes
+// (2x int16) are trailing/unaccounted-for (see PADDING note).
+// Trailer overlay image position(s) plus an optional rotation center.
+// ============================================================
+struct OPS_TrailerImageRecord {
+    short name             <bgcolor=cRed,     comment="TRAILERIMG_FIELDS[0] -- plain int16, NOT a length-prefixed string despite the field name; on-disk position certain, real-world meaning unconfirmed">;
+    short xpos              <bgcolor=cLtGreen, comment="TRAILERIMG_FIELDS[1]. (0,0) is treated as unset/padding">;
+    short ypos              <bgcolor=cLtGreen, comment="TRAILERIMG_FIELDS[2]. (0,0) is treated as unset/padding">;
+    short rotation_xpos      <bgcolor=cLtGreen, comment="TRAILERIMG_FIELDS[3] -- rotation-center X; meaningful when it differs from xpos">;
+    short rotation_ypos      <bgcolor=cLtGreen, comment="TRAILERIMG_FIELDS[4] -- rotation-center Y; meaningful when it differs from ypos">;
+};
+
+struct OPS_TrailerImageData {
+    OPS_TrailerImageRecord record[2] <optimize=false, comment="TRAILERIMG_ROWS_DECLARED = 2">;
+    short padding[2] <bgcolor=cYellow, comment="Trailing bytes after the 2x5 documented record table (24 - 2*5*2 = 4 bytes = 2x int16). See PADDING note in header comment">;
+};
+
+// ============================================================
+// MAIN PARSE
+// ============================================================
+
+OPS_FileHeader fileHeader;
+
+if (fileHeader.magic != OPS_MAGIC_EXPECTED)
+    Warning("OPS: unexpected magic 0x%04X at offset 0 (expected 0x%04X / %d) -- this may not be an OPS file. Structured parsing continues anyway as a best-effort fallback.",
+        (ushort)fileHeader.magic, (ushort)OPS_MAGIC_EXPECTED, OPS_MAGIC_EXPECTED);
+
+if (fileHeader.version < OPS_VERSION_MIN)
+    Warning("OPS: version %d is below the minimum supported version (%d). This template parses anyway as a best-effort fallback; treat the result with extra suspicion.",
+        fileHeader.version, OPS_VERSION_MIN);
+else if (fileHeader.version != OPS_VERSION_EXPECTED)
+    Warning("OPS: version %d does not match the expected version %d -- the section layout below assumes the V%d structure and may not fully apply.",
+        fileHeader.version, OPS_VERSION_EXPECTED, OPS_VERSION_EXPECTED);
+
+if (FileSize() != OPS_TOTAL_SIZE_EXPECTED)
+    Warning("OPS: file size is %d bytes; the documented OPS layout is exactly %d bytes. This may be a config_mini.ops variant, a different version's layout, or a truncated/corrupt file -- sections beyond the end of this file will fail to map.",
+        FileSize(), OPS_TOTAL_SIZE_EXPECTED);
+
+Printf("=== OPS File ===\nmagic=0x%04X  version=%d  file_size=%d  expected_size=%d\n",
+    (ushort)fileHeader.magic, fileHeader.version, FileSize(), OPS_TOTAL_SIZE_EXPECTED);
+
+OPS_ReservedHeader header;
+Printf("[header]        offset 0x%04X, 1024 bytes, reserved/undocumented\n", startof(header));
+
+OPS_MirrorData mirrorData;
+Printf("[mirrorData]    offset 0x%04X: mirrorAxisY=%d mirrorCorrection=%d mirrorAxisY_RO=%d mirrorCorrection_RO=%d\n",
+    startof(mirrorData), mirrorData.mirrorAxisY, mirrorData.mirrorCorrection,
+    mirrorData.mirrorAxisY_RO, mirrorData.mirrorCorrection_RO);
+
+OPS_ImageMetaData imageMetaData;
+Printf("[imageMetaData] offset 0x%04X: backgroundAlpha=%d\n", startof(imageMetaData), imageMetaData.backgroundAlpha);
+
+OPS_TrackData trackData;
+Printf("[trackData]     offset 0x%04X: start=(%d,%d) frontAxle=(%d,%d) rearAxle=(%d,%d) lOffset=%d rOffset=%d frontToFront=%d corner=%d overhang=%d unmapped11=%d\n",
+    startof(trackData), trackData.startX, trackData.startY, trackData.frontAxleX, trackData.frontAxleY,
+    trackData.rearAxleX, trackData.rearAxleY, trackData.lOffset, trackData.rOffset,
+    trackData.frontToFront, trackData.corner, trackData.overhang, trackData.unmapped11);
+
+OPS_AreaViewData areaViewData;
+Printf("[areaViewData]  offset 0x%04X, 1007x int16, structure unconfirmed (raw values only)\n", startof(areaViewData));
+
+OPS_SegmentData segmentData;
+Printf("[segmentData]   offset 0x%04X: 98 record(s) x 12 int16 field(s)\n", startof(segmentData));
+OpsReportPadding("segmentData.padding", segmentData.padding, 872);
+
+OPS_AdditionalGraphics additionalGraphics;
+Printf("[additionalGraphics] offset 0x%04X: 44 record(s) x 10 int16 field(s)\n", startof(additionalGraphics));
+OpsReportPadding("additionalGraphics.padding", additionalGraphics.padding, 72);
+
+OPS_CarSpecificImageData carSpecificImageData;
+Printf("[carSpecificImageData] offset 0x%04X: 2 record(s) x 3 int16 field(s)\n", startof(carSpecificImageData));
+local int carIdx;
+for (carIdx = 0; carIdx < 2; carIdx++)
+    Printf("  car[%d] name=%d xpos=%d ypos=%d\n", carIdx,
+        carSpecificImageData.record[carIdx].name, carSpecificImageData.record[carIdx].xpos,
+        carSpecificImageData.record[carIdx].ypos);
+OpsReportPadding("carSpecificImageData.padding", carSpecificImageData.padding, 6);
+
+OPS_TrailerImageData trailerImageData;
+Printf("[trailerImageData] offset 0x%04X: 2 record(s) x 5 int16 field(s)\n", startof(trailerImageData));
+local int trailerIdx;
+for (trailerIdx = 0; trailerIdx < 2; trailerIdx++)
+    Printf("  trailer[%d] name=%d xpos=%d ypos=%d rotation_xpos=%d rotation_ypos=%d\n", trailerIdx,
+        trailerImageData.record[trailerIdx].name, trailerImageData.record[trailerIdx].xpos,
+        trailerImageData.record[trailerIdx].ypos, trailerImageData.record[trailerIdx].rotation_xpos,
+        trailerImageData.record[trailerIdx].rotation_ypos);
+OpsReportPadding("trailerImageData.padding", trailerImageData.padding, 2);
+
+// ============================================================
+// TRAILING BYTES
+// The documented layout is exactly 8244 bytes with no footer/checksum --
+// segmentData ends the format. Anything left over is either a parsing
+// desync (unlikely, since this format has no branching/variable-length
+// sections) or a config_mini.ops-style variant / corrupt file.
+// ============================================================
+local quad consumed = FTell();
+local quad remaining = FileSize() - consumed;
+if (remaining > 0) {
+    Warning("OPS: %d unparsed trailing byte(s) after trailerImageData (consumed 0x%x of 0x%x) -- likely a config_mini.ops variant or other non-standard layout, not the documented fixed 8244-byte format.", remaining, consumed, FileSize());
+    uchar trailingData[remaining] <bgcolor=cRed, comment="Unparsed trailing bytes -- beyond the documented 8244-byte OPS layout">;
+} else if (remaining < 0) {
+    Warning("OPS: parsing overran the end of the file by %d byte(s) -- the file is shorter than the fixed 8244-byte OPS layout.", -remaining);
+}
+
+Printf("=== End of OPS parse -- consumed 0x%x of 0x%x byte(s) ===\n", consumed, FileSize());
