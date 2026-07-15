@@ -2,7 +2,7 @@
 //--- 010 Editor v14.0 Binary Template
 //
 // File:        ops_format.bt
-// Author:      Jille
+// Author:      Jille / MQBTools
 // Revision:    1.0
 // Purpose:     MIB3 Optical Parking System (OPS) binary config file parser
 //              for config.ops / config_mini.ops. These files describe the
@@ -39,8 +39,14 @@
 //
 //   Section            Offset   Length  Declared shape
 //   -----------------  -------  ------  --------------------------------
-//   header             0x0004   1024 B  512x int16, NO known per-field
-//                                       layout (reserved/padding region)
+//   header             0x0004   1024 B  512x int16. First 54x int16
+//                                       (108 B) = segmentsPerSector[54]
+//                                       (Java-verified). Remaining 458x
+//                                       int16 (916 B, offset 0x0070-0x0403 /
+//                                       decimal bytes 112-1027) CONFIRMED
+//                                       0xFFFF sentinel padding -- verified
+//                                       across all 24 real .ops sample
+//                                       files, 100% consistent
 //   mirrorData         0x0404      8 B  4x int16 named fields
 //   imageMetaData      0x040C      2 B  1x int16 named field
 //   trackData          0x040E     24 B  12x int16 (11 named + 1 unmapped)
@@ -98,14 +104,16 @@
 //              docs/gca_format.bt.
 //   cYellow  = Structural/padding region -- present and byte-accurate,
 //              but not itself meaningful "data" (trailing padding shorts
-//              after a record table).
+//              after a record table; this now also covers header's
+//              916-byte 0x0070-0x0403 region, CONFIRMED 0xFFFF sentinel
+//              padding across all 24 real .ops sample files reviewed).
 //   cRed     = On-disk position/type is certain (it's inside a section
 //              whose length and record shape are documented), but the
 //              real-world *meaning* of the value is unconfirmed --
 //              "name" fields, trackData.unmapped11, inset.
-//   cSilver  = Entirely undocumented reserved region (the 1024-byte
-//              "header" section) and the unstructured 1007-value
-//              "areaViewData" blob -- byte-accurate position only.
+//   cSilver  = Entirely undocumented reserved region -- currently only
+//              the unstructured 1007-value "areaViewData" blob --
+//              byte-accurate position only.
 //--------------------------------------
 
 LittleEndian();
@@ -243,11 +251,11 @@ typedef enum <uchar> {
 //   (etc. -- a front-only counterpart to showRearOnly and an area-view
 //   toggle are expected to exist alongside these but were not
 //   individually confirmed by name). None of these flags have a known
-//   offset; the most plausible location is somewhere inside the
-//   1024-byte OPS_ReservedHeader region below, since that is the only
-//   remaining section large enough to hold a handful of small
-//   integer/boolean settings that aren't part of any of the 8 other,
-//   already record-shaped sections.
+//   offset. The header's 0x0070-0x0403 region (OPS_ReservedHeader.padding)
+//   was previously suspected as their most plausible home, but that
+//   region is now CONFIRMED 0xFFFF sentinel padding across all 24 real
+//   .ops sample files reviewed -- ruling it out. The true storage offset
+//   remains unconfirmed.
 //
 // --- Vehicle calibration semantics ---------------------------------
 //   wheelBase    -- distance between front and rear axle centers. For a
@@ -318,10 +326,17 @@ void OpsReportPadding(string label, short arr[], int count) {
 
 // ============================================================
 // SECTION 1: header (offset 0x0004, 1024 bytes / 512x int16)
-// Entirely reserved/undocumented -- no known per-field layout.
+// First 108 bytes (54x int16, offset 0x0004-0x006F) = segmentsPerSector[54]
+// (Java-verified identity: number of segmentData records per sensor sector).
+// Remaining 916 bytes (458x int16, offset 0x0070-0x0403) are CONFIRMED
+// 0xFFFF sentinel padding -- verified across all 24 real .ops sample
+// files reviewed, 100% consistent (every int16 value == -1 in every
+// sample). Not a guess/assumption like the other trailing-padding
+// regions below; this one is fully confirmed by direct observation.
 // ============================================================
 struct OPS_ReservedHeader {
-    short raw[512] <bgcolor=cSilver, comment="Reserved region, offset 0x0004-0x0403. No known per-field layout -- exposed as a flat raw int16 array only">;
+    short segmentsPerSector[54] <bgcolor=cLtGreen, comment="Offset 0x0004-0x006F (108 bytes / 54x int16). segmentsPerSector[sector_id] -- number of segmentData records per sensor sector (Java-verified name/identity)">;
+    short padding[458] <bgcolor=cYellow, comment="Offset 0x0070-0x0403 (916 bytes / 458x int16). CONFIRMED 0xFFFF sentinel padding -- verified across all 24 real .ops sample files reviewed, 100% consistent (every int16 value == -1)">;
 };
 
 // ============================================================
@@ -487,7 +502,8 @@ Printf("=== OPS File ===\nmagic=0x%04X  version=%d  file_size=%d  expected_size=
     (ushort)fileHeader.magic, fileHeader.version, FileSize(), OPS_TOTAL_SIZE_EXPECTED);
 
 OPS_ReservedHeader header;
-Printf("[header]        offset 0x%04X, 1024 bytes, reserved/undocumented\n", startof(header));
+Printf("[header]        offset 0x%04X, 1024 bytes: segmentsPerSector[54] (0x0004-0x006F) + padding[458] (0x0070-0x0403)\n", startof(header));
+OpsReportPadding("header.padding", header.padding, 458);
 
 OPS_MirrorData mirrorData;
 Printf("[mirrorData]    offset 0x%04X: mirrorAxisY=%d mirrorCorrection=%d mirrorAxisY_RO=%d mirrorCorrection_RO=%d\n",
