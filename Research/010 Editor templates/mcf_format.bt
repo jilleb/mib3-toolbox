@@ -1,0 +1,1258 @@
+//--------------------------------------
+//--- 010 Editor v14.0 Binary Template
+//
+// File:        mcf_format.bt
+// Author:      Jille
+// Revision:    1.1  (H42 corrections + animation system)
+// Purpose:     Universal MCF container parser — all 21 chunk types
+//              Supports: car_lhd.mcf (3D scene, 996 chunks)
+//                        images.mcf  (2D graphics, 1643 IMG chunks)
+//
+// Color coding:
+//   cLtGreen  = Verified / fully known
+//   cDkGreen  = Zlib magic bytes (known to be zlib)
+//   cYellow   = Partially known (generic outer header fields)
+//   cRed      = Unknown / not yet researched
+//   cDkGray   = Zlib-compressed payload (opaque until decompressed)
+//   cLtGray   = Alignment padding (always 0x00)
+//   cSilver   = Trailing CRC32 (verified formula)
+//
+// Universal chunk layout (zlib chunks):
+//   [28B outer header] [N-byte format header] [zlib stream] [0-3B padding] [4B CRC32]
+//
+// CRC32 formula (verified on 1007+ chunks, 100% match rate):
+//   crc32( format_header || zlib_stream || padding_bytes )
+//   — ISO 3309 polynomial (0xEDB88320), little-endian u32
+//
+// LAYOUT CONSTANTS:
+//   FILE_HEADER_SIZE  = 20  (0x14)
+//   TOC_CHUNK_SIZE    = 28  (0x1C) + 4B entry count = 32B  → combined 52B (0x34)
+//   TOC_ENTRY_SIZE    = 16  (4B tag + 4B id + 4B offset + 4B length)
+//   OUTER_HDR_SIZE    = 28  (all non-TOC chunks)
+//
+// Format header sizes by chunk type:
+//   MESH=44B  VTXB=12B  IDXB=8B    MODL=28B  NODE=24B  VTXF=4B
+//   TEX=28B   LGHT=60B  CAM=24B    ANIM=44B  CLIP=36B  TRAK=20B  [TEX corrected 2026-08-16, was 36B]
+//   SCEN=16B  OBJA=4B   IMG=36B    TOC=varies
+//   BONE=var  MORF=var  SKEL=var   SKIN=var  (SkarData MCF only) [H42]
+//--------------------------------------
+
+LittleEndian();
+
+// ============================================================
+// HELPER: read a 4-char tag as a display string
+// ============================================================
+string TagToStr(char tag[4]) {
+    local string s;
+    SPrintf(s, "%c%c%c%c", tag[0], tag[1], tag[2], tag[3]);
+    return s;
+}
+
+// ============================================================
+// ENUMS — data types and animation constants  [H42]
+// ============================================================
+
+// dataCompressionType: outer header +0x14 (1 byte, followed by 3 reserved bytes)
+typedef enum <uchar> {
+    COMPRESS_NONE   = 0,  // Raw / uncompressed payload
+    COMPRESS_ZLIB   = 1   // zlib deflate (0x78 0xDA header)
+} DataCompressionType;
+
+// Animation channel type: ANIM format header channel_type field
+typedef enum <uint> {
+    CHAN_CAMERA   = 0,
+    CHAN_LIGHT    = 1,
+    CHAN_MATERIAL = 2,
+    CHAN_NODE     = 3,
+    CHAN_MORPH    = 4,
+    CHAN_SKIN     = 5
+} AnimChannelType;
+
+// Interpolation type: ANIM format header interp_type and per-keyframe interp fields
+typedef enum <uint> {
+    INTERP_STEP         = 0,
+    INTERP_LINEAR       = 1,
+    INTERP_BEZIER       = 2,
+    INTERP_HERMITE      = 3,
+    INTERP_CARDINAL     = 4,
+    INTERP_BSPLINE      = 5,
+    INTERP_CUBIC_SPLINE = 6
+} AnimInterpolationType;
+
+// ============================================================
+// FILE HEADER (20 bytes, 0x00–0x13)
+// ============================================================
+// Two known magic variants:
+//   3D scene:  89 4D 43 46 ("MCF\x89" LE view) — sig1=0x46434D89, sig2=0x0D0A1A0A
+//   Images:    49 4D 43 46 ("IMCF")            — sig1=0x46434D49
+//
+// Bytes 0x08-0x0B: version byte + checksum_type byte + 2B reserved
+// Bytes 0x0C-0x0F: content_version (or file-id — purpose unclear)
+// Bytes 0x10-0x13: file_header_crc (CRC32[0x00..0x10) — verified in images.mcf)
+// ============================================================
+struct MCF_FileHeader {
+    uchar magic[4]           <bgcolor=cLtGreen, comment="File magic: 89 4D 43 46 (3D) or 49 4D 43 46 (IMG)">;  // +0x00
+    uchar cr                 <bgcolor=cLtGreen, comment="0x0D carriage-return sentinel">;                        // +0x04
+    uchar lf                 <bgcolor=cLtGreen, comment="0x0A line-feed sentinel">;                              // +0x05
+    uchar sub                <bgcolor=cLtGreen, comment="0x1A SUB/EOF sentinel">;                                // +0x06
+    uchar lf2                <bgcolor=cLtGreen, comment="0x0A second line-feed sentinel">;                       // +0x07
+    uchar version            <bgcolor=cYellow,  comment="Format version (typically 1)">;                         // +0x08
+    uchar checksum_type      <bgcolor=cYellow,  comment="0=none 1=CRC32 2=Adler32">;                             // +0x09
+    ushort reserved          <bgcolor=cRed,     comment="Reserved, purpose unknown">;                            // +0x0A
+    uint content_version     <bgcolor=cYellow,  comment="Content version / file-ID (purpose unclear)">;          // +0x0C
+    uint file_header_crc     <bgcolor=cSilver,  comment="CRC32[0x00..0x10) — validated in images.mcf">;          // +0x10
+};
+
+MCF_FileHeader file_hdr;
+Printf("MCF File — magic=0x%02X%02X%02X%02X  version=%d  checksum_type=%d  content_version=0x%08X\n",
+    file_hdr.magic[0], file_hdr.magic[1], file_hdr.magic[2], file_hdr.magic[3],
+    file_hdr.version, file_hdr.checksum_type, file_hdr.content_version);
+
+// ============================================================
+// TOC CHUNK HEADER (28 bytes, starts at 0x14) + entry count (4B at 0x2C)
+//
+// The TOC is itself a pseudo-chunk with tag "TOC ". Its outer header
+// is 28B, followed immediately by a 4B entry count at +0x2C.
+// Combined: 0x14 + 28 + 4 = 0x34 = 52 bytes total preamble.
+//
+// toc_header.size     = byte count of TOC entries table (entryCount × 16)
+// toc_header.compSize = same value (duplicate in images.mcf; may differ in 3D MCF)
+// toc_header.checksum = CRC32[0x14..0x2C) — verified in images.mcf
+// ============================================================
+struct TOC_Header {
+    char tag[4]         <bgcolor=cLtGreen, comment="Always 'TOC '">;               // +0x14
+    uint id             <bgcolor=cLtGreen, comment="TOC chunk id (typically 0)">;  // +0x18
+    uint unk_flags      <bgcolor=cRed,     comment="Purpose unknown (often 4)">;   // +0x1C
+    uint size           <bgcolor=cLtGreen, comment="Byte count of TOC entry table (count*16)">;  // +0x20
+    uint compSize       <bgcolor=cLtGreen, comment="Duplicate of size field">;                   // +0x24
+    uint unk_2          <bgcolor=cRed,     comment="Purpose unknown (often 0)">;                 // +0x28
+    uint toc_meta_crc   <bgcolor=cSilver,  comment="CRC32[0x14..0x2C) — validates TOC metadata">; // +0x2C
+    uint entryCount     <bgcolor=cLtGreen, comment="Number of TOC entries (= number of chunks)">; // +0x30
+};
+
+TOC_Header toc_hdr;
+Printf("TOC: %d entries (table=%dB)\n", toc_hdr.entryCount, toc_hdr.size);
+
+// ============================================================
+// TOC ENTRIES (16 bytes each, starts at 0x34)
+//
+//   +0   tag[4]      — chunk type tag  e.g. "MESH", "IMG "
+//   +4   id (u32)    — 1-based chunk id, used for cross-references
+//   +8   offset(u32) — absolute byte offset of chunk from file start
+//   +12  length(u32) — total byte count of chunk (outer_hdr + fmt_hdr + zlib + pad + crc)
+// ============================================================
+struct TOC_Entry {
+    char tag[4]     <bgcolor=cLtGreen, comment="Chunk type tag">;
+    uint id         <bgcolor=cLtGreen, comment="Chunk id (1-based)">;
+    uint fileOffset <bgcolor=cLtGreen, comment="Absolute offset from file start">;
+    uint length     <bgcolor=cLtGreen, comment="Total byte length of chunk">;
+};
+
+TOC_Entry toc[toc_hdr.entryCount] <optimize=false>;
+
+// ============================================================
+// TOC FOOTER (8 bytes)
+//
+// Sits immediately after the last TOC entry. NOT at a hardcoded offset.
+// Compute: toc_footer_offset = 0x34 + entryCount * 16
+//
+// Layout (verified car_lhd.mcf):
+//   +0: toc_body_crc (u32) — CRC32[0x30 .. toc_footer_offset) — covers count + all entries
+//   +4: unknown_u32  (u32) — purpose unknown (value 0x13BCF95A in car_lhd.mcf example)
+//
+// Note: in images.mcf only 4B footer (toc_body_crc) was observed.
+// The 3D scene MCF has an 8B footer. Read both conservatively.
+// ============================================================
+local uint TOC_FOOTER_OFFSET = 0x34 + toc_hdr.entryCount * 16;
+
+uint toc_body_crc    <bgcolor=cSilver, comment="CRC32[0x30..toc_footer) — covers entryCount + all TOC entries">;
+// Probe: if next 4 bytes look like a valid u32 before the first chunk, read them as footer_unk
+local quad first_chunk_offset = (toc_hdr.entryCount > 0) ? toc[0].fileOffset : FTell() + 8;
+local quad footer_end = FTell();
+if (first_chunk_offset - footer_end >= 4) {
+    uint toc_footer_unk  <bgcolor=cRed, comment="8B footer extra field (purpose unknown)">;
+}
+
+Printf("TOC footer at 0x%04X — body_crc=0x%08X\n", TOC_FOOTER_OFFSET, toc_body_crc);
+
+// ============================================================
+// SHARED OUTER CHUNK HEADER (28 bytes)
+//
+//   +0x00  tag[4]        — ASCII chunk type ("MESH", "VTXB", etc.)
+//   +0x04  id (u32)      — 1-based chunk index
+//   +0x08  fmt_hdr_size  — byte count of the format-specific header that follows
+//   +0x0C  comp_size     — byte count of the zlib-compressed payload (0 = raw/no-zlib)
+//   +0x10  decomp_size   — decompressed payload size (0 = no payload)
+//   +0x14  always_1      — always observed as 1 (purpose unknown, maybe flags)
+//   +0x18  pre_crc       — unknown; NOT the trailing CRC32; role unclear
+// ============================================================
+typedef struct {
+    char                 tag[4]               <bgcolor=cLtGreen, comment="Chunk type tag">;          // +0x00
+    uint                 id                   <bgcolor=cLtGreen, comment="1-based chunk id">;         // +0x04
+    uint                 fmt_hdr_size         <bgcolor=cLtGreen, comment="Format header byte count">; // +0x08
+    uint                 comp_size            <bgcolor=cLtGreen, comment="Compressed payload byte count (0=raw)">;   // +0x0C
+    uint                 decomp_size          <bgcolor=cLtGreen, comment="Decompressed size (0=no payload)">; // +0x10
+    DataCompressionType  dataCompressionType  <bgcolor=cYellow,  comment="[H42] 0=raw 1=zlib deflate">;  // +0x14
+    uchar                reserved[3]          <bgcolor=cLtGray,  comment="[H42] 3 reserved bytes (always 0x00)">;    // +0x15
+    uint                 preamble_crc         <bgcolor=cSilver,  comment="[H42] CRC32([+0x00..+0x18)) — 6th CRC point">; // +0x18
+} ChunkOuterHdr;
+
+// ============================================================
+// MACRO: compute padding bytes needed after zlib to reach 4-byte alignment
+// padding = (4 - ((fmt_hdr_size + comp_size) % 4)) % 4
+// Note: alignment is computed relative to start of format header (+0x1C from chunk start)
+// ============================================================
+
+// ============================================================
+// CHUNK STRUCTURES — one per known chunk type
+// ============================================================
+
+// ---- MESH (format header 44B, zlib body = VB ids + primitive records) ----
+// [H42 corrected] Format header:
+//   +0x1C: vertexBufferCount -- number of u32 VTXB ids in body
+//   +0x20: primitivesCount  -- number of 48B primitive records in body
+// Body layout [H42]:
+//   [vertexBufferCount x u32]  VTXB chunk ids
+//   [primitivesCount  x 48B]  primitive records:
+//     +0: type(u8) bv_type(u8) res(u16) min_idx(u32) max_idx(u32) start_idx(u32) idx_count(u32) bounding(28B)
+// H40 note: prior "vtxb_id" = vertexBufferCount, "idxb_id" = primitivesCount -- values happened to be usable
+typedef struct {
+    local quad chunk_start = FTell();
+    ChunkOuterHdr hdr;
+
+    // Format header (44 bytes = 11 x u32)
+    uint vertexBufferCount  <bgcolor=cLtGreen, comment="+0x1C: [H42] number of VTXB ids in body">;      // +0x1C
+    uint primitivesCount    <bgcolor=cLtGreen, comment="+0x20: [H42] number of 48B primitive records in body">; // +0x20
+    uint fh_unk_2           <bgcolor=cRed,     comment="+0x24: always 1 (purpose unknown)">;              // +0x24
+    uint fh_unk_3           <bgcolor=cRed,     comment="+0x28: always 1 (purpose unknown)">;              // +0x28
+    uint fh_unk_4           <bgcolor=cRed,     comment="+0x2C: purpose unknown">;                         // +0x2C
+    uint fh_unk_5           <bgcolor=cRed,     comment="+0x30: purpose unknown">;                         // +0x30
+    uint fh_unk_6           <bgcolor=cRed,     comment="+0x34: purpose unknown">;                         // +0x34
+    uint fh_unk_7           <bgcolor=cRed,     comment="+0x38: purpose unknown">;                         // +0x38
+    uint fh_unk_8           <bgcolor=cRed,     comment="+0x3C: purpose unknown">;                         // +0x3C
+    uint fh_unk_9           <bgcolor=cRed,     comment="+0x40: purpose unknown">;                         // +0x40
+    uint fh_unk_10          <bgcolor=cRed,     comment="+0x44: purpose unknown">;                         // +0x44
+
+    // Zlib stream (body = VB id list + primitive records)
+    if (hdr.comp_size >= 2) {
+        uchar zlib_magic[2]  <bgcolor=cDkGreen, comment="Zlib magic 0x78 0xDA">;
+        if (hdr.comp_size > 2)
+            uchar zlib_data[hdr.comp_size - 2] <bgcolor=cDkGray, comment="Zlib body: vertexBufferCount*u32 + primitivesCount*48B">;
+    }
+
+    // Alignment padding (0-3 x 0x00)
+    local int pad = (4 - ((44 + hdr.comp_size) % 4)) % 4;
+    if (pad > 0)
+        uchar padding[pad]  <bgcolor=cLtGray, comment="Alignment padding (0x00 bytes)">;
+
+    // Trailing CRC32 -- crc32(format_header || zlib || padding)
+    uint crc32  <bgcolor=cSilver, comment="CRC32(fmt_hdr44 || zlib || padding)">;
+
+    Printf("  MESH id=%d  vbCount=%d  primCount=%d  zlib=%dB  crc32=0x%08X
+",
+        hdr.id, vertexBufferCount, primitivesCount, hdr.comp_size, crc32);
+} MESH_Chunk;
+
+// ---- VTXB (format header 12B, zlib body = vertex pool) ----
+// [2026-08-16, H42 corrected] vertex_stride ("vertexSize") is a single BYTE
+// at +0x20, followed by 3 reserved 0x00 padding bytes (+0x21-0x23) to keep
+// the 12B header 4-byte aligned — it is NOT a u32. Reading it as u32
+// happened to still work in every observed sample (the 3 reserved bytes are
+// always 0, so the upper 24 bits of a little-endian u32 read are 0 too), but
+// mislabeled the field width. vertexFormatId (+0x1C) links to a VTXF chunk.
+// DO NOT hardcode the stride value itself to 32 — always read it from the file.
+// At stride=32: pos3f(+0) nrm3f(+12) uv2f(+24)
+typedef struct {
+    local quad chunk_start = FTell();
+    ChunkOuterHdr hdr;
+
+    // Format header (12 bytes)
+    uint  vertex_format_id <bgcolor=cLtGreen, comment="+0x1C: vertexFormatId — links to a VTXF chunk">;  // +0x1C
+    ubyte vertex_stride    <bgcolor=cLtGreen, comment="+0x20: vertexSize (u8) — READ DYNAMICALLY, DO NOT hardcode">;  // +0x20
+    uchar vs_reserved[3]   <bgcolor=cLtGray,  comment="+0x21: 3 reserved bytes (always 0x00, 4-byte alignment pad)">; // +0x21
+    uint  vertex_count     <bgcolor=cLtGreen, comment="+0x24: vertexCount — should equal decomp_size / vertex_stride">; // +0x24
+
+    // Zlib stream
+    if (hdr.comp_size >= 2) {
+        uchar zlib_magic[2]  <bgcolor=cDkGreen, comment="Zlib magic 0x78 0xDA">;
+        if (hdr.comp_size > 2)
+            uchar zlib_data[hdr.comp_size - 2] <bgcolor=cDkGray, comment="Zlib-compressed vertex buffer">;
+    }
+
+    local int pad = (4 - ((12 + hdr.comp_size) % 4)) % 4;
+    if (pad > 0)
+        uchar padding[pad]  <bgcolor=cLtGray, comment="Alignment padding">;
+
+    uint crc32  <bgcolor=cSilver, comment="CRC32(fmt_hdr12 || zlib || padding)">;
+
+    Printf("  VTXB id=%d  stride=%d  vert_count=%d  zlib=%dB  crc32=0x%08X\n",
+        hdr.id, vertex_stride,
+        (vertex_stride > 0) ? hdr.decomp_size / vertex_stride : 0,
+        hdr.comp_size, crc32);
+} VTXB_Chunk;
+
+// ---- IDXB (format header 8B, zlib body = index array) ----
+// [2026-08-16, H42 corrected] indexSize is a single BYTE at +0x1C (value:
+// 1=u8 2=u16 4=u32), followed by 3 reserved 0x00 padding bytes (+0x1D-0x1F)
+// to keep the 8B header 4-byte aligned — it is NOT a u32. Reading it as u32
+// happened to still work in every observed sample (reserved bytes are always
+// 0) but mislabeled the field width.
+// index_count = decomp_size / bytes_per_index
+typedef struct {
+    local quad chunk_start = FTell();
+    ChunkOuterHdr hdr;
+
+    // Format header (8 bytes)
+    ubyte bytes_per_index <bgcolor=cLtGreen, comment="+0x1C: index element size (u8): 1=u8 2=u16 4=u32">;  // +0x1C
+    uchar bpi_reserved[3] <bgcolor=cLtGray,  comment="+0x1D: 3 reserved bytes (always 0x00, 4-byte alignment pad)">; // +0x1D
+    uint  index_count     <bgcolor=cLtGreen, comment="+0x20: indexCount — should equal decomp_size / bytes_per_index">; // +0x20
+
+    // Zlib stream
+    if (hdr.comp_size >= 2) {
+        uchar zlib_magic[2]  <bgcolor=cDkGreen, comment="Zlib magic 0x78 0xDA">;
+        if (hdr.comp_size > 2)
+            uchar zlib_data[hdr.comp_size - 2] <bgcolor=cDkGray, comment="Zlib-compressed index buffer">;
+    }
+
+    local int pad = (4 - ((8 + hdr.comp_size) % 4)) % 4;
+    if (pad > 0)
+        uchar padding[pad]  <bgcolor=cLtGray, comment="Alignment padding">;
+
+    uint crc32  <bgcolor=cSilver, comment="CRC32(fmt_hdr8 || zlib || padding)">;
+
+    local string idx_type_s = "u8";
+    if (bytes_per_index == 2) idx_type_s = "u16";
+    else if (bytes_per_index == 4) idx_type_s = "u32";
+    Printf("  IDXB id=%d  index_type=%s  index_count=%d  zlib=%dB  crc32=0x%08X\n",
+        hdr.id, idx_type_s,
+        (bytes_per_index > 0) ? hdr.decomp_size / bytes_per_index : 0,
+        hdr.comp_size, crc32);
+} IDXB_Chunk;
+
+// ---- NODE (format header 24B, zlib body = transform slots) ----
+// Format header (24B = 6 × u32):
+//   fh[0]=MODL_id  fh[1]=slot_count  fh[2..4]=unknown  fh[5]=parent_NODE_id
+// Body: slot_count × 112B slots
+//   Slot 0 (+0x00): u32 id, pos.xyz (3×f32), ...identity/flags
+//   Slot 1+ (+112B each): rotation axis-angle at +124-136, scale at +140-148
+// NODE 1 = scene root (self-referencing parent_id=1)
+typedef struct {
+    local quad chunk_start = FTell();
+    ChunkOuterHdr hdr;
+
+    // Format header (24 bytes = 6 × u32)
+    uint modl_id        <bgcolor=cLtGreen, comment="+0x1C: MODL chunk id (0=group node with no geometry)">;  // +0x1C
+    uint slot_count     <bgcolor=cLtGreen, comment="+0x20: number of transform slots in body">;               // +0x20
+    uint fh_unk_2       <bgcolor=cRed,     comment="+0x24: purpose unknown">;                                  // +0x24
+    uint fh_unk_3       <bgcolor=cRed,     comment="+0x28: purpose unknown">;                                  // +0x28
+    uint fh_unk_4       <bgcolor=cRed,     comment="+0x2C: purpose unknown">;                                  // +0x2C
+    uint parent_node_id <bgcolor=cLtGreen, comment="+0x30: parent NODE id (NODE 1 self-refs as root)">;        // +0x30
+
+    // Zlib stream
+    if (hdr.comp_size >= 2) {
+        uchar zlib_magic[2]  <bgcolor=cDkGreen, comment="Zlib magic 0x78 0xDA">;
+        if (hdr.comp_size > 2)
+            uchar zlib_data[hdr.comp_size - 2] <bgcolor=cDkGray, comment="Zlib-compressed transform data (slot_count * 112B)">;
+    }
+
+    local int pad = (4 - ((24 + hdr.comp_size) % 4)) % 4;
+    if (pad > 0)
+        uchar padding[pad]  <bgcolor=cLtGray, comment="Alignment padding">;
+
+    uint crc32  <bgcolor=cSilver, comment="CRC32(fmt_hdr24 || zlib || padding)">;
+
+    Printf("  NODE id=%d  modl_id=%d  slot_count=%d  parent_id=%d  zlib=%dB  crc32=0x%08X\n",
+        hdr.id, modl_id, slot_count, parent_node_id, hdr.comp_size, crc32);
+} NODE_Chunk;
+
+// ---- MODL (format header 28B, raw body 4B = single u32 MATL id) ----
+// No zlib: comp_size=0, raw flat data
+// Format header (28B = 7 × u32):
+//   fh[0]=0  fh[1]=0  fh[2]=MESH_id  fh[3]=1  fh[4]=0  fh[5]=0  fh[6]=0
+// Body (4B): single u32 = MATL id (material/texture binding)
+// Linkage: NODE.modl_id → MODL.mesh_id → MESH → VTXB/IDXB/TEX
+typedef struct {
+    local quad chunk_start = FTell();
+    ChunkOuterHdr hdr;
+
+    // Format header (28 bytes = 7 × u32)
+    uint fh_0           <bgcolor=cRed,     comment="+0x1C: always 0">;                                // +0x1C
+    uint fh_1           <bgcolor=cRed,     comment="+0x20: always 0">;                                // +0x20
+    uint mesh_id        <bgcolor=cLtGreen, comment="+0x24: MESH chunk id this instance references">;  // +0x24
+    uint fh_3           <bgcolor=cRed,     comment="+0x28: always 1">;                                // +0x28
+    uint fh_4           <bgcolor=cRed,     comment="+0x2C: always 0">;                                // +0x2C
+    uint fh_5           <bgcolor=cRed,     comment="+0x30: always 0">;                                // +0x30
+    uint fh_6           <bgcolor=cRed,     comment="+0x34: always 0">;                                // +0x34
+
+    // Raw body (4B = MATL id) — no zlib in MODL
+    if (hdr.decomp_size >= 4) {
+        uint matl_id    <bgcolor=cLtGreen, comment="MATL chunk id (material/texture binding)">;
+    } else if (hdr.decomp_size > 0) {
+        uchar raw_body[hdr.decomp_size]  <bgcolor=cRed, comment="Raw MODL body">;
+    }
+
+    Printf("  MODL id=%d  mesh_id=%d  matl_id=%d\n",
+        hdr.id, mesh_id, (hdr.decomp_size >= 4) ? matl_id : 0);
+} MODL_Chunk;
+
+// ---- MATL (no zlib, raw flat binary, variable length) ----
+// Profile A (212B total chunk):  color RGBA @ +0x3C, TEX_id @ +0x4C  [confirmed car_lhd.mcf]
+// Profile B (308B total chunk):  offsets TBD — log warning and dump raw
+// Profile C (196B total chunk):  offsets TBD — log warning and dump raw
+// Header-CRC: crc32(bytes[0x00:0x18]) @ +0x18
+// Body-CRC:   crc32(bytes[0x1C:len-4]) @ end  (must recompute when editing color)
+// Material type u32 @ +0x20: 256=simple, 512=complex
+typedef struct (int toc_length) {
+    local quad chunk_start = FTell();
+
+    // Outer header (28B) — NOTE: outer hdr fmt_hdr_size=0 for MATL (raw, no separate fmt-hdr)
+    ChunkOuterHdr hdr;
+
+    // For MATL the payload is raw (no separate format header, no zlib, no trailing CRC32)
+    local int body_len = toc_length - 28;
+
+    if (toc_length == 212) {
+        // ---- Profile A (212B) — confirmed car_lhd.mcf ----
+        // Outer hdr ends at chunk+28; raw payload is chunk[28..212)
+        // Within raw payload (relative to chunk start):
+        //   +0x18 (=24): header_crc u32 — crc32(bytes[0x00:0x18])
+        //   +0x1C (=28): material_type u32 — 256=simple 512=complex
+        //   +0x3C (=60): base_color RGBA 4×f32
+        //   +0x4C (=76): diffuse_tex_id u32  (0=no texture)
+
+        // Outer header ends at chunk+28 (0x1C).  The raw payload starts there.
+        // Note: chunk+0x18 = outer hdr preamble_crc [H42] (already read above in ChunkOuterHdr).
+        // chunk+0x1C (= byte 28) is where the MATL raw body begins (= material_type field).
+        uint  material_type  <bgcolor=cLtGreen, comment="Material type: 256=simple 512=complex">;   // chunk+0x1C (=28)
+        uint  matl_unk_1     <bgcolor=cRed,     comment="Purpose unknown">;                          // chunk+0x20
+        uint  matl_unk_2     <bgcolor=cRed,     comment="Purpose unknown">;                          // chunk+0x24
+        uint  matl_unk_3     <bgcolor=cRed,     comment="Purpose unknown">;                          // chunk+0x28
+        uint  matl_unk_4     <bgcolor=cRed,     comment="Purpose unknown">;                          // chunk+0x2C
+        uint  matl_unk_5     <bgcolor=cRed,     comment="Purpose unknown">;                          // chunk+0x30
+        uint  matl_unk_6     <bgcolor=cRed,     comment="Purpose unknown">;                          // chunk+0x34
+        uint  matl_unk_7     <bgcolor=cRed,     comment="Purpose unknown">;                          // chunk+0x38
+        // chunk+0x3C: base color RGBA
+        float color_r        <bgcolor=cLtGreen, comment="Base color R (0.0-1.0)">;                   // chunk+0x3C
+        float color_g        <bgcolor=cLtGreen, comment="Base color G (0.0-1.0)">;                   // chunk+0x40
+        float color_b        <bgcolor=cLtGreen, comment="Base color B (0.0-1.0)">;                   // chunk+0x44
+        float color_a        <bgcolor=cLtGreen, comment="Base color A (0.0-1.0)">;                   // chunk+0x48
+        // chunk+0x4C: diffuse texture id
+        uint  diffuse_tex_id <bgcolor=cLtGreen, comment="Diffuse TEX chunk id (0=no texture)">;      // chunk+0x4C
+        // Remaining bytes
+        local int tail_len = body_len - 4 - 4*7 - 4*4 - 4;  // = 212-28-4-28-16-4 = 132B
+        if (tail_len > 4) {
+            uchar matl_body_tail[tail_len - 4]  <bgcolor=cRed, comment="Remaining MATL body (unknown fields)">;
+        }
+        uint  body_crc       <bgcolor=cSilver, comment="CRC32(chunk[0x1C..len-4]) — must recompute when editing">;
+        Printf("  MATL id=%d  profile=A(212B)  type=%d  rgba=(%.3f,%.3f,%.3f,%.3f)  tex_id=%d\n",
+            hdr.id, material_type, color_r, color_g, color_b, color_a, diffuse_tex_id);
+    } else {
+        // Unknown profile — dump raw
+        local string p_label = "?";
+        if (toc_length == 308) p_label = "B(308B-TBD)";
+        else if (toc_length == 196) p_label = "C(196B-TBD)";
+        if (body_len > 0)
+            uchar matl_raw[body_len]  <bgcolor=cRed, comment="Raw MATL body — profile offsets unknown">;
+        Printf("  MATL id=%d  profile=%s  raw=%dB  (offsets unverified — dump only)\n",
+            hdr.id, p_label, body_len);
+    }
+} MATL_Chunk;
+
+// ---- TEX (format header 28B, zlib body = mip table + pixel data) ----
+// [2026-08-16, H42 corrected] Format header is 28B of typed fields, NOT the
+// previously-assumed 36B of 9 mostly-unknown u32s:
+//   +0x1C textureType        u8   — 0=1D 1=2D 2=3D 3=Cube
+//   +0x1D transparencyHint   u8   — opacity/alpha usage hint
+//   +0x1E textureFormat      u16  — pixel format code (low byte previously read
+//                                   ad-hoc as "pixel_format_byte": 0x43=RGBA8888,
+//                                   else=RGB24 — byte offset unchanged by this fix)
+//   +0x20 layerCount         u8   — 1=standard 6=cubemap N=texture array
+//   +0x21 mipLevelCount      u8   — mip level count
+//   +0x22 minFilter          u8   — minification filter enum
+//   +0x23 magFilter          u8   — magnification filter enum
+//   +0x24 mipFilter          u8   — mip filter enum
+//   +0x25 wrapS              u8   — S-axis wrap mode enum
+//   +0x26 wrapT              u8   — T-axis wrap mode enum
+//   +0x27 wrapR              u8   — R-axis wrap mode enum
+//   +0x28 borderColor        4×f32 (RGBA, 16B)
+// Body: mip_table (u32 width, u32 height, u32 size) × mip_count, then zlib-compressed pixel data
+// The zlib stream start is NOT hardcoded here — it always falls out of
+// hdr.fmt_hdr_size (28), matching the universal "28B outer + fmt_hdr_size"
+// rule used throughout this template and in the JS parser's decompressChunk().
+typedef struct {
+    local quad chunk_start = FTell();
+    ChunkOuterHdr hdr;
+
+    // Format header (28 bytes)
+    ubyte texture_type      <bgcolor=cLtGreen, comment="+0x1C: textureType enum">;             // +0x1C
+    ubyte transparency_hint <bgcolor=cLtGreen, comment="+0x1D: transparencyHint enum">;         // +0x1D
+    ushort texture_format   <bgcolor=cLtGreen, comment="+0x1E: textureFormat — pixel format code (was read ad-hoc as a single byte here)">; // +0x1E
+    ubyte layer_count       <bgcolor=cLtGreen, comment="+0x20: layerCount">;                    // +0x20
+    ubyte mip_level_count   <bgcolor=cLtGreen, comment="+0x21: mipLevelCount">;                 // +0x21
+    ubyte min_filter        <bgcolor=cYellow,  comment="+0x22: minFilter enum">;                // +0x22
+    ubyte mag_filter        <bgcolor=cYellow,  comment="+0x23: magFilter enum">;                // +0x23
+    ubyte mip_filter        <bgcolor=cYellow,  comment="+0x24: mipFilter enum">;                // +0x24
+    ubyte wrap_s            <bgcolor=cYellow,  comment="+0x25: wrapS enum">;                    // +0x25
+    ubyte wrap_t            <bgcolor=cYellow,  comment="+0x26: wrapT enum">;                    // +0x26
+    ubyte wrap_r            <bgcolor=cYellow,  comment="+0x27: wrapR enum">;                    // +0x27
+    float border_color_r    <bgcolor=cLtGreen, comment="+0x28: borderColor R">;                 // +0x28
+    float border_color_g    <bgcolor=cLtGreen, comment="+0x2C: borderColor G">;                 // +0x2C
+    float border_color_b    <bgcolor=cLtGreen, comment="+0x30: borderColor B">;                 // +0x30
+    float border_color_a    <bgcolor=cLtGreen, comment="+0x34: borderColor A">;                 // +0x34
+
+    // pixel_format_byte kept for backward-compat with the old ad-hoc heuristic:
+    // low byte of texture_format at chunk+0x1E (0x43=RGBA8888, else=RGB24).
+    local uchar pixel_format_byte = texture_format & 0xFF;
+    local string pf_str = (pixel_format_byte == 0x43) ? "RGBA8888(4bpp)" : "RGB24(3bpp)";
+
+    // Zlib stream
+    if (hdr.comp_size >= 2) {
+        uchar zlib_magic[2]  <bgcolor=cDkGreen, comment="Zlib magic 0x78 0xDA">;
+        if (hdr.comp_size > 2)
+            uchar zlib_data[hdr.comp_size - 2] <bgcolor=cDkGray, comment="Zlib-compressed mip table + pixel data">;
+    }
+
+    local int pad = (4 - ((28 + hdr.comp_size) % 4)) % 4;
+    if (pad > 0)
+        uchar padding[pad]  <bgcolor=cLtGray, comment="Alignment padding">;
+
+    uint crc32  <bgcolor=cSilver, comment="CRC32(fmt_hdr28 || zlib || padding)">;
+
+    Printf("  TEX id=%d  pixel_fmt=0x%02X(%s)  fmt16=0x%04X  layers=%d  mips=%d  decomp=%dB  zlib=%dB  crc32=0x%08X\n",
+        hdr.id, pixel_format_byte, pf_str, texture_format, layer_count, mip_level_count, hdr.decomp_size, hdr.comp_size, crc32);
+} TEX_Chunk;
+
+// ---- LGHT (format header 60B, raw flat data — no zlib) ----
+// Format header (60B = 15 × u32 / mixed types):
+//   +0x00 node_id    u32  — paired NODE for position/orientation
+//   +0x04 type       u32  — 1=directional 2=spot
+//   +0x08 color_r    f32  — R (0.0-1.0, all lights: white=1.0)
+//   +0x0C color_g    f32  — G
+//   +0x10 color_b    f32  — B
+//   +0x14 color_a    f32  — A
+//   +0x24 intensity  f32  — 0.0 or -1.0 in car_lhd (runtime-animated via ANIM)
+//   +0x40 cone_angle f32  — spot light cone (type=2 only)
+//   Remaining fields: unknown
+// car_lhd.mcf: all 4 lights have intensity <= 0 (forced min 0.3 + ambient fallback in viewer)
+typedef struct (int toc_length) {
+    ChunkOuterHdr hdr;
+
+    local int body_len = toc_length - 28;
+
+    // Format header / raw body (60B if no separate fmt_hdr)
+    if (body_len >= 60) {
+        uint  node_id       <bgcolor=cLtGreen, comment="+0x1C: NODE chunk id for position/orientation">;
+        uint  light_type    <bgcolor=cLtGreen, comment="+0x20: 1=directional 2=spot">;
+        float color_r       <bgcolor=cLtGreen, comment="+0x24: color R (0.0-1.0)">;
+        float color_g       <bgcolor=cLtGreen, comment="+0x28: color G">;
+        float color_b       <bgcolor=cLtGreen, comment="+0x2C: color B">;
+        float color_a       <bgcolor=cLtGreen, comment="+0x30: color A">;
+        uint  lght_unk_0    <bgcolor=cRed,     comment="+0x34: purpose unknown">;
+        uint  lght_unk_1    <bgcolor=cRed,     comment="+0x38: purpose unknown">;
+        uint  lght_unk_2    <bgcolor=cRed,     comment="+0x3C: purpose unknown">;
+        uint  lght_unk_3    <bgcolor=cRed,     comment="+0x40: purpose unknown">;
+        float intensity     <bgcolor=cLtGreen, comment="+0x44: light intensity (0.0 or -1.0 in car_lhd; runtime-animated)">;
+        uint  lght_unk_5    <bgcolor=cRed,     comment="+0x48: purpose unknown">;
+        uint  lght_unk_6    <bgcolor=cRed,     comment="+0x4C: purpose unknown">;
+        uint  lght_unk_7    <bgcolor=cRed,     comment="+0x50: purpose unknown">;
+        float cone_angle    <bgcolor=cLtGreen, comment="+0x54: spot cone angle (type=2 only)">;
+
+        local int tail = body_len - 60;
+        if (tail > 0) uchar lght_tail[tail]  <bgcolor=cRed, comment="Extra LGHT bytes">;
+
+        local string lt_str = (light_type == 1) ? "directional" : (light_type == 2) ? "spot" : "unknown";
+        Printf("  LGHT id=%d  node_id=%d  type=%s  rgba=(%.2f,%.2f,%.2f,%.2f)  intensity=%.2f  cone=%.2f\n",
+            hdr.id, node_id, lt_str, color_r, color_g, color_b, color_a, intensity, cone_angle);
+    } else {
+        uchar lght_raw[body_len]  <bgcolor=cRed, comment="Raw LGHT data (unexpected short length)">;
+        Printf("  LGHT id=%d  raw=%dB (unexpected short)\n", hdr.id, body_len);
+    }
+} LGHT_Chunk;
+
+// ---- CAM (format header 24B, raw flat data — no zlib) ----
+// Format header (24B = 6 × u32 / mixed types):
+//   +0x00 node_ref   u32  — 191 in car_lhd.mcf (exceeds NODE range 1-139; purpose unclear)
+//   +0x04 unk        u32  — always 1
+//   +0x08 fov_deg    f32  — field of view in degrees (10.0 in car_lhd.mcf)
+//   +0x0C far_clip   f32  — far clip distance (3500.0)
+//   +0x10 near_clip  f32  — near clip distance (0.3205)
+//   +0x14 unk_f32    f32  — purpose unknown (18.31 in car_lhd.mcf)
+typedef struct (int toc_length) {
+    ChunkOuterHdr hdr;
+
+    local int body_len = toc_length - 28;
+
+    if (body_len >= 24) {
+        uint  node_ref      <bgcolor=cRed,     comment="+0x1C: node reference (191 in car_lhd, exceeds NODE range; may ref OBJA/MODL namespace)">;
+        uint  cam_unk_0     <bgcolor=cRed,     comment="+0x20: always 1">;
+        float fov_degrees   <bgcolor=cLtGreen, comment="+0x24: field of view in degrees">;
+        float far_clip      <bgcolor=cLtGreen, comment="+0x28: far clip plane distance">;
+        float near_clip     <bgcolor=cLtGreen, comment="+0x2C: near clip plane distance">;
+        float cam_unk_f32   <bgcolor=cRed,     comment="+0x30: purpose unknown (18.31 in car_lhd.mcf)">;
+
+        local int tail = body_len - 24;
+        if (tail > 0) uchar cam_tail[tail]  <bgcolor=cRed, comment="Extra CAM bytes">;
+
+        Printf("  CAM id=%d  node_ref=%d  fov=%.2f  far=%.1f  near=%.4f\n",
+            hdr.id, node_ref, fov_degrees, far_clip, near_clip);
+    } else {
+        uchar cam_raw[body_len]  <bgcolor=cRed, comment="Raw CAM data">;
+        Printf("  CAM id=%d  raw=%dB\n", hdr.id, body_len);
+    }
+} CAM_Chunk;
+
+// ---- SCEN (format header 16B, zlib body = child id array) ----
+// Format header (16B = 4 × u32):
+//   +0x00 root_node   u32 — ROOT NODE id (=1 in car_lhd.mcf)
+//   +0x04 unk_1       u32 — always 1
+//   +0x08 unk_2       u32 — always 1
+//   +0x0C child_count u32 — number of top-level scene objects (156 in car_lhd.mcf)
+// Body (zlib): child_count × u32 — sequential ids [1..child_count]
+typedef struct {
+    local quad chunk_start = FTell();
+    ChunkOuterHdr hdr;
+
+    // Format header (16 bytes)
+    uint root_node      <bgcolor=cLtGreen, comment="+0x1C: root NODE id (=1=scene root)">;
+    uint scen_unk_1     <bgcolor=cRed,     comment="+0x20: always 1">;
+    uint scen_unk_2     <bgcolor=cRed,     comment="+0x24: always 1">;
+    uint child_count    <bgcolor=cLtGreen, comment="+0x28: number of top-level children">;
+
+    // Zlib stream (body = child_count × u32)
+    if (hdr.comp_size >= 2) {
+        uchar zlib_magic[2]  <bgcolor=cDkGreen, comment="Zlib magic 0x78 0xDA">;
+        if (hdr.comp_size > 2)
+            uchar zlib_data[hdr.comp_size - 2] <bgcolor=cDkGray, comment="Zlib-compressed child id array (child_count * 4B)">;
+    }
+
+    local int pad = (4 - ((16 + hdr.comp_size) % 4)) % 4;
+    if (pad > 0)
+        uchar padding[pad]  <bgcolor=cLtGray, comment="Alignment padding">;
+
+    uint crc32  <bgcolor=cSilver, comment="CRC32(fmt_hdr16 || zlib || padding)">;
+
+    Printf("  SCEN id=%d  root_node=%d  child_count=%d  zlib=%dB  crc32=0x%08X\n",
+        hdr.id, root_node, child_count, hdr.comp_size, crc32);
+} SCEN_Chunk;
+
+// ---- OBJA (format header 4B, zlib body = hash/binary lookup table ~22892B) ----
+// Format header (4B = 1 × u32):
+//   +0x00 version u32 — value 2 observed in car_lhd.mcf
+// Body: irregular u32 array (not sequential) — likely binary search tree / hash table
+// Used for runtime object lookups by name hash; not needed for static geometry.
+typedef struct {
+    local quad chunk_start = FTell();
+    ChunkOuterHdr hdr;
+
+    // Format header (4 bytes)
+    uint obja_version   <bgcolor=cYellow, comment="+0x1C: version (=2)">;
+
+    // Zlib stream
+    if (hdr.comp_size >= 2) {
+        uchar zlib_magic[2]  <bgcolor=cDkGreen, comment="Zlib magic 0x78 0xDA">;
+        if (hdr.comp_size > 2)
+            uchar zlib_data[hdr.comp_size - 2] <bgcolor=cDkGray, comment="Zlib-compressed hash/lookup table (~22892B decompressed)">;
+    }
+
+    local int pad = (4 - ((4 + hdr.comp_size) % 4)) % 4;
+    if (pad > 0)
+        uchar padding[pad]  <bgcolor=cLtGray, comment="Alignment padding">;
+
+    uint crc32  <bgcolor=cSilver, comment="CRC32(fmt_hdr4 || zlib || padding)">;
+
+    Printf("  OBJA id=%d  version=%d  decomp=%dB  zlib=%dB  crc32=0x%08X\n",
+        hdr.id, obja_version, hdr.decomp_size, hdr.comp_size, crc32);
+} OBJA_Chunk;
+
+// ---- VTXF (format header 4B, zlib body = vertex format descriptor ~15B) ----
+// Format header (4B = 1 × u32): format descriptor, exact meaning unknown
+// Body: 15B decompressed — attribute layout specification (unknown structure)
+typedef struct {
+    local quad chunk_start = FTell();
+    ChunkOuterHdr hdr;
+
+    // Format header (4 bytes)
+    uint vtxf_desc      <bgcolor=cRed, comment="+0x1C: vertex format descriptor (purpose unknown)">;
+
+    // Zlib stream
+    if (hdr.comp_size >= 2) {
+        uchar zlib_magic[2]  <bgcolor=cDkGreen, comment="Zlib magic 0x78 0xDA">;
+        if (hdr.comp_size > 2)
+            uchar zlib_data[hdr.comp_size - 2] <bgcolor=cDkGray, comment="Zlib-compressed vertex format descriptor (~15B)">;
+    }
+
+    local int pad = (4 - ((4 + hdr.comp_size) % 4)) % 4;
+    if (pad > 0)
+        uchar padding[pad]  <bgcolor=cLtGray, comment="Alignment padding">;
+
+    uint crc32  <bgcolor=cSilver, comment="CRC32(fmt_hdr4 || zlib || padding)">;
+
+    Printf("  VTXF id=%d  vtxf_desc=0x%08X  decomp=%dB  zlib=%dB  crc32=0x%08X\n",
+        hdr.id, vtxf_desc, hdr.decomp_size, hdr.comp_size, crc32);
+} VTXF_Chunk;
+
+// ---- ANIM (format header 44B, zlib body = keyframe curve data) ----
+// [H42] Format header (44B = 11 x u32):
+//   channel_type, attribute_id, keyframe_count, value_component_count, interp_type, target_id
+//   + 5 unknown fields
+// Body (zlib): keyframe_count records of:
+//   f32 time + u32 interp + (2 x f32 tangents if BEZIER) + value_component_count x f32 values
+// See AnimChannelType and AnimInterpolationType enums above.
+// Attribute constants: LIGHT_INTENSITY=1001, NODE_TRANSFORM_TRANSLATE=3001, etc.
+typedef struct {
+    local quad chunk_start = FTell();
+    ChunkOuterHdr hdr;
+
+    // Format header (44 bytes = 11 x u32) [H42]
+    AnimChannelType      channel_type           <bgcolor=cLtGreen, comment="+0x1C: [H42] target channel category (CAMERA/LIGHT/MATERIAL/NODE/MORPH/SKIN)">;
+    uint                 attribute_id           <bgcolor=cLtGreen, comment="+0x20: [H42] channel attribute (1001=LIGHT_INTENSITY 3001=NODE_TRANSLATE 3002=NODE_ROTATE etc)">;
+    uint                 keyframe_count         <bgcolor=cLtGreen, comment="+0x24: [H42] number of keyframes">;
+    uint                 value_component_count  <bgcolor=cLtGreen, comment="+0x28: [H42] components per value (1=scalar 3=vec3 4=quat)">;
+    AnimInterpolationType interp_type           <bgcolor=cLtGreen, comment="+0x2C: [H42] default interpolation type">;
+    uint                 target_id              <bgcolor=cLtGreen, comment="+0x30: [H42] target chunk id (NODE/LGHT/etc)">;
+    uint                 anim_unk_0             <bgcolor=cRed,     comment="+0x34: purpose unknown">;
+    uint                 anim_unk_1             <bgcolor=cRed,     comment="+0x38: purpose unknown">;
+    uint                 anim_unk_2             <bgcolor=cRed,     comment="+0x3C: purpose unknown">;
+    uint                 anim_unk_3             <bgcolor=cRed,     comment="+0x40: purpose unknown">;
+    uint                 anim_unk_4             <bgcolor=cRed,     comment="+0x44: purpose unknown">;
+
+    // Zlib stream (keyframe array)
+    if (hdr.comp_size >= 2) {
+        uchar zlib_magic[2]  <bgcolor=cDkGreen, comment="Zlib magic 0x78 0xDA">;
+        if (hdr.comp_size > 2)
+            uchar zlib_data[hdr.comp_size - 2] <bgcolor=cDkGray, comment="Zlib body: keyframe_count records of (time+interp+[tangents]+values)">;
+    }
+
+    local int pad = (4 - ((44 + hdr.comp_size) % 4)) % 4;
+    if (pad > 0)
+        uchar padding[pad]  <bgcolor=cLtGray, comment="Alignment padding">;
+
+    uint crc32  <bgcolor=cSilver, comment="CRC32(fmt_hdr44 || zlib || padding)">;
+
+    local string attr_name = "?";
+    if (attribute_id == 1001) attr_name = "LIGHT_INTENSITY";
+    else if (attribute_id == 1002) attr_name = "LIGHT_COLOR";
+    else if (attribute_id == 3001) attr_name = "NODE_TRANSLATE";
+    else if (attribute_id == 3002) attr_name = "NODE_ROTATE";
+    else if (attribute_id == 3003) attr_name = "NODE_SCALE";
+    else if (attribute_id == 3004) attr_name = "NODE_VISIBLE";
+    else if (attribute_id == 4001) attr_name = "MATERIAL_DIFFUSE";
+    else if (attribute_id == 5001) attr_name = "MORPH_WEIGHT";
+    Printf("  ANIM id=%d  chan=%d  attr=%d(%s)  keys=%d  comps=%d  target=%d  zlib=%dB  crc32=0x%08X
+",
+        hdr.id, (int)channel_type, attribute_id, attr_name, keyframe_count, value_component_count,
+        target_id, hdr.comp_size, crc32);
+} ANIM_Chunk;
+
+// ---- CLIP (format header 36B, zlib body = TRAK id list) ----
+// [H42] Format header (36B = 9 x u32):
+//   clip_duration(ms), trak_count, loop_mode, + 6 unknown fields
+// Body (zlib): trak_count x u32 TRAK chunk ids
+// loop_mode: 0=once, 1=loop, 2=ping-pong
+typedef struct {
+    local quad chunk_start = FTell();
+    ChunkOuterHdr hdr;
+
+    // Format header (36 bytes = 9 x u32) [H42]
+    uint clip_duration  <bgcolor=cLtGreen, comment="+0x1C: [H42] clip duration in milliseconds">;
+    uint trak_count     <bgcolor=cLtGreen, comment="+0x20: [H42] number of TRAK chunk ids in body">;
+    uint loop_mode      <bgcolor=cLtGreen, comment="+0x24: [H42] 0=once 1=loop 2=ping-pong">;
+    uint clip_unk_0     <bgcolor=cRed,     comment="+0x28: purpose unknown">;
+    uint clip_unk_1     <bgcolor=cRed,     comment="+0x2C: purpose unknown">;
+    uint clip_unk_2     <bgcolor=cRed,     comment="+0x30: purpose unknown">;
+    uint clip_unk_3     <bgcolor=cRed,     comment="+0x34: purpose unknown">;
+    uint clip_unk_4     <bgcolor=cRed,     comment="+0x38: purpose unknown">;
+    uint clip_unk_5     <bgcolor=cRed,     comment="+0x3C: purpose unknown">;
+
+    // Zlib stream (body = trak_count x u32 TRAK ids)
+    if (hdr.comp_size >= 2) {
+        uchar zlib_magic[2]  <bgcolor=cDkGreen, comment="Zlib magic 0x78 0xDA">;
+        if (hdr.comp_size > 2)
+            uchar zlib_data[hdr.comp_size - 2] <bgcolor=cDkGray, comment="Zlib body: trak_count x u32 TRAK chunk ids">;
+    }
+
+    local int pad = (4 - ((36 + hdr.comp_size) % 4)) % 4;
+    if (pad > 0)
+        uchar padding[pad]  <bgcolor=cLtGray, comment="Alignment padding">;
+
+    uint crc32  <bgcolor=cSilver, comment="CRC32(fmt_hdr36 || zlib || padding)">;
+
+    local string loop_str = "once";
+    if (loop_mode == 1) loop_str = "loop";
+    else if (loop_mode == 2) loop_str = "ping-pong";
+    Printf("  CLIP id=%d  dur=%dms  trak_count=%d  loop=%s  zlib=%dB  crc32=0x%08X
+",
+        hdr.id, clip_duration, trak_count, loop_str, hdr.comp_size, crc32);
+} CLIP_Chunk;
+
+// ---- TRAK (format header 20B, zlib body = per-track metadata) ----
+// [H42] Format header (20B = 5 x u32):
+//   anim_id, target_node_id, attribute_id + 2 unknown fields
+// Body (zlib): per-track metadata structure (TBD, may be empty)
+typedef struct {
+    local quad chunk_start = FTell();
+    ChunkOuterHdr hdr;
+
+    // Format header (20 bytes = 5 x u32) [H42]
+    uint anim_id           <bgcolor=cLtGreen, comment="+0x1C: [H42] ANIM chunk id this track drives">;
+    uint target_node_id    <bgcolor=cLtGreen, comment="+0x20: [H42] target NODE (or LGHT/CAM) chunk id">;
+    uint attribute_id      <bgcolor=cLtGreen, comment="+0x24: [H42] channel attribute constant (see ANIM enums)">;
+    uint trak_unk_0        <bgcolor=cRed,     comment="+0x28: purpose unknown">;
+    uint trak_unk_1        <bgcolor=cRed,     comment="+0x2C: purpose unknown">;
+
+    // Zlib stream
+    if (hdr.comp_size >= 2) {
+        uchar zlib_magic[2]  <bgcolor=cDkGreen, comment="Zlib magic 0x78 0xDA">;
+        if (hdr.comp_size > 2)
+            uchar zlib_data[hdr.comp_size - 2] <bgcolor=cDkGray, comment="Zlib body: per-track metadata (structure TBD)">;
+    }
+
+    local int pad = (4 - ((20 + hdr.comp_size) % 4)) % 4;
+    if (pad > 0)
+        uchar padding[pad]  <bgcolor=cLtGray, comment="Alignment padding">;
+
+    uint crc32  <bgcolor=cSilver, comment="CRC32(fmt_hdr20 || zlib || padding)">;
+
+    local string attr_name = "?";
+    if (attribute_id == 1001) attr_name = "LIGHT_INTENSITY";
+    else if (attribute_id == 3001) attr_name = "NODE_TRANSLATE";
+    else if (attribute_id == 3002) attr_name = "NODE_ROTATE";
+    else if (attribute_id == 3003) attr_name = "NODE_SCALE";
+    Printf("  TRAK id=%d  anim_id=%d  target_id=%d  attr=%d(%s)  zlib=%dB  crc32=0x%08X
+",
+        hdr.id, anim_id, target_node_id, attribute_id, attr_name, hdr.comp_size, crc32);
+} TRAK_Chunk;
+
+// ---- BONE / MORF / SKEL / SKIN (SkarData MCF only) ----
+// [H42] These chunk types appear in .skar MCF files (SkarData variant, magic 53 4B 41 52).
+// Not present in car_lhd.mcf or images.mcf.
+// Full format specs pending dedicated SkarData MCF sample.
+typedef struct (int toc_length) {
+    local quad chunk_start = FTell();
+    ChunkOuterHdr hdr;
+    local int remaining = toc_length - 28;
+    if (remaining > 0)
+        uchar bone_body[remaining]  <bgcolor=cRed, comment="BONE body: skeletal bone definition (format TBD) [H42]">;
+    Printf("  BONE id=%d  total=%dB
+", hdr.id, toc_length);
+} BONE_Chunk;
+
+typedef struct (int toc_length) {
+    local quad chunk_start = FTell();
+    ChunkOuterHdr hdr;
+    local int remaining = toc_length - 28;
+    if (remaining > 0)
+        uchar morf_body[remaining]  <bgcolor=cRed, comment="MORF body: morph target deltas (format TBD) [H42]">;
+    Printf("  MORF id=%d  total=%dB
+", hdr.id, toc_length);
+} MORF_Chunk;
+
+typedef struct (int toc_length) {
+    local quad chunk_start = FTell();
+    ChunkOuterHdr hdr;
+    local int remaining = toc_length - 28;
+    if (remaining > 0)
+        uchar skel_body[remaining]  <bgcolor=cRed, comment="SKEL body: skeleton hierarchy (format TBD) [H42]">;
+    Printf("  SKEL id=%d  total=%dB
+", hdr.id, toc_length);
+} SKEL_Chunk;
+
+typedef struct (int toc_length) {
+    local quad chunk_start = FTell();
+    ChunkOuterHdr hdr;
+    local int remaining = toc_length - 28;
+    if (remaining > 0)
+        uchar skin_body[remaining]  <bgcolor=cRed, comment="SKIN body: skin weights (format TBD) [H42]">;
+    Printf("  SKIN id=%d  total=%dB
+", hdr.id, toc_length);
+} SKIN_Chunk;
+
+// ---- IMG (format header 36B, zlib body = compressed image pixels) ----
+// Used in images.mcf (1643 chunks). See docs/images_mcf_format.md for full spec.
+// Format header (36B):
+//   +0  tag[4]            — always "IMG "
+//   +4  file_id (u32)     — unique id (1-indexed)
+//   +8  field_08 (u32)    — purpose unknown (often 0x08)
+//   +12 zsize_padded(u32) — padded zlib data byte count (includes null padding)
+//   +16 max_pixel_count(u32) — width*height*bytes_per_pixel (uncompressed size)
+//   +20 field_20 (u32)    — purpose unknown (often 0x01)
+//   +24 hash_1 (u32)      — CRC32(blob[0..23]) — validates first 24B of header
+//   +28 width (s16)       — image width in pixels
+//   +30 height (s16)      — image height in pixels
+//   +32 image_mode (s16)  — 4356=RGBA(4bpp) 4096=L8(1bpp) 4368=LA(2bpp)
+//   +34 field_34 (s16)    — purpose unknown; preserved from original; included in hash_2
+// Note: IMG chunks are their own self-contained format — they do NOT share the outer ChunkOuterHdr
+// structure used by 3D scene chunks. They are parsed differently.
+typedef struct (int toc_length) {
+    // IMG blob header (36 bytes)
+    char  img_tag[4]        <bgcolor=cLtGreen, comment="+0: always 'IMG '">;
+    uint  img_file_id       <bgcolor=cLtGreen, comment="+4: unique image id (1-based)">;
+    uint  img_field_08      <bgcolor=cYellow,  comment="+8: purpose unknown (often 0x08)">;
+    uint  img_zsize_padded  <bgcolor=cLtGreen, comment="+12: padded zlib byte count (zlib+null-pad)">;
+    uint  img_max_pixels    <bgcolor=cLtGreen, comment="+16: width*height*bytes_per_pixel (uncompressed)">;
+    uint  img_field_20      <bgcolor=cYellow,  comment="+20: purpose unknown (often 0x01)">;
+    uint  img_hash_1        <bgcolor=cSilver,  comment="+24: CRC32(blob[0..23]) validates first 24B">;
+    short img_width         <bgcolor=cLtGreen, comment="+28: image width in pixels">;
+    short img_height        <bgcolor=cLtGreen, comment="+30: image height in pixels">;
+    short img_mode          <bgcolor=cLtGreen, comment="+32: pixel format: 4356=RGBA 4096=L8 4368=LA">;
+    short img_field_34      <bgcolor=cYellow,  comment="+34: purpose unknown; included in hash_2">;
+
+    // Zlib data (img_zsize_padded bytes: actual zlib + null padding to 4B boundary)
+    if (img_zsize_padded >= 2) {
+        uchar img_zlib_magic[2]  <bgcolor=cDkGreen, comment="Zlib magic 0x78 0xDA">;
+        if (img_zsize_padded > 2)
+            uchar img_zlib_data[img_zsize_padded - 2]  <bgcolor=cDkGray, comment="Zlib-compressed pixel data + null-padding">;
+    }
+
+    // hash_2: CRC32( width(s16) + height(s16) + image_mode(s16) + field_34(s16) + padded_zlib )
+    uint  img_hash_2        <bgcolor=cSilver, comment="CRC32(width+height+mode+field_34(8B) + padded_zlib)">;
+
+    local string mode_str = "?";
+    if (img_mode == 4356) mode_str = "RGBA";
+    else if (img_mode == 4096) mode_str = "L8";
+    else if (img_mode == 4368) mode_str = "LA";
+    Printf("  IMG id=%d  %dx%d  mode=%s(%d)  zlib_padded=%dB\n",
+        img_file_id, img_width, img_height, mode_str, img_mode, img_zsize_padded);
+} IMG_Chunk;
+
+// ============================================================
+// MAIN CHUNK PARSE LOOP
+// Iterates all TOC entries in order.
+// Seeks to each chunk's absolute offset and dispatches to the
+// appropriate typed struct, or falls back to a generic dump.
+// ============================================================
+
+Printf("\n=== MCF CHUNK PARSE (%d entries) ===\n", toc_hdr.entryCount);
+
+local int i;
+local string chunk_tag;
+local int chunk_len;
+local int matl_count = 0, mesh_count = 0, vtxb_count = 0, idxb_count = 0;
+local int node_count = 0, modl_count = 0, tex_count = 0, img_count = 0;
+local int anim_count = 0, clip_count = 0, trak_count = 0, other_count = 0;
+local int bone_count = 0, morf_count = 0, skel_count = 0, skin_count = 0;
+local int scen_count = 0, lght_count = 0, cam_count = 0, obja_count = 0, vtxf_count = 0;
+
+for (i = 0; i < toc_hdr.entryCount; i++) {
+    FSeek(toc[i].fileOffset);
+    chunk_tag = TagToStr(toc[i].tag);
+    chunk_len = toc[i].length;
+
+    if (chunk_tag == "MESH") {
+        Printf("[%04d] MESH %d at 0x%06X (%dB)\n", i, toc[i].id, toc[i].fileOffset, chunk_len);
+        MESH_Chunk mesh_chunk;
+        mesh_count++;
+    }
+    else if (chunk_tag == "VTXB") {
+        Printf("[%04d] VTXB %d at 0x%06X (%dB)\n", i, toc[i].id, toc[i].fileOffset, chunk_len);
+        VTXB_Chunk vtxb_chunk;
+        vtxb_count++;
+    }
+    else if (chunk_tag == "IDXB") {
+        Printf("[%04d] IDXB %d at 0x%06X (%dB)\n", i, toc[i].id, toc[i].fileOffset, chunk_len);
+        IDXB_Chunk idxb_chunk;
+        idxb_count++;
+    }
+    else if (chunk_tag == "NODE") {
+        Printf("[%04d] NODE %d at 0x%06X (%dB)\n", i, toc[i].id, toc[i].fileOffset, chunk_len);
+        NODE_Chunk node_chunk;
+        node_count++;
+    }
+    else if (chunk_tag == "MODL") {
+        Printf("[%04d] MODL %d at 0x%06X (%dB)\n", i, toc[i].id, toc[i].fileOffset, chunk_len);
+        MODL_Chunk modl_chunk;
+        modl_count++;
+    }
+    else if (chunk_tag == "MATL") {
+        Printf("[%04d] MATL %d at 0x%06X (%dB)\n", i, toc[i].id, toc[i].fileOffset, chunk_len);
+        MATL_Chunk matl_chunk(chunk_len);
+        matl_count++;
+    }
+    else if (chunk_tag == "TEX ") {
+        Printf("[%04d] TEX  %d at 0x%06X (%dB)\n", i, toc[i].id, toc[i].fileOffset, chunk_len);
+        TEX_Chunk tex_chunk;
+        tex_count++;
+    }
+    else if (chunk_tag == "LGHT") {
+        Printf("[%04d] LGHT %d at 0x%06X (%dB)\n", i, toc[i].id, toc[i].fileOffset, chunk_len);
+        LGHT_Chunk lght_chunk(chunk_len);
+        lght_count++;
+    }
+    else if (chunk_tag == "CAM ") {
+        Printf("[%04d] CAM  %d at 0x%06X (%dB)\n", i, toc[i].id, toc[i].fileOffset, chunk_len);
+        CAM_Chunk cam_chunk(chunk_len);
+        cam_count++;
+    }
+    else if (chunk_tag == "SCEN") {
+        Printf("[%04d] SCEN %d at 0x%06X (%dB)\n", i, toc[i].id, toc[i].fileOffset, chunk_len);
+        SCEN_Chunk scen_chunk;
+        scen_count++;
+    }
+    else if (chunk_tag == "OBJA") {
+        Printf("[%04d] OBJA %d at 0x%06X (%dB)\n", i, toc[i].id, toc[i].fileOffset, chunk_len);
+        OBJA_Chunk obja_chunk;
+        obja_count++;
+    }
+    else if (chunk_tag == "VTXF") {
+        Printf("[%04d] VTXF %d at 0x%06X (%dB)\n", i, toc[i].id, toc[i].fileOffset, chunk_len);
+        VTXF_Chunk vtxf_chunk;
+        vtxf_count++;
+    }
+    else if (chunk_tag == "ANIM") {
+        Printf("[%04d] ANIM %d at 0x%06X (%dB)\n", i, toc[i].id, toc[i].fileOffset, chunk_len);
+        ANIM_Chunk anim_chunk;
+        anim_count++;
+    }
+    else if (chunk_tag == "CLIP") {
+        Printf("[%04d] CLIP %d at 0x%06X (%dB)\n", i, toc[i].id, toc[i].fileOffset, chunk_len);
+        CLIP_Chunk clip_chunk;
+        clip_count++;
+    }
+    else if (chunk_tag == "TRAK") {
+        Printf("[%04d] TRAK %d at 0x%06X (%dB)\n", i, toc[i].id, toc[i].fileOffset, chunk_len);
+        TRAK_Chunk trak_chunk;
+        trak_count++;
+    }
+    else if (chunk_tag == "IMG ") {
+        Printf("[%04d] IMG  %d at 0x%06X (%dB)\n", i, toc[i].id, toc[i].fileOffset, chunk_len);
+        IMG_Chunk img_chunk(chunk_len);
+        img_count++;
+    }
+    else if (chunk_tag == "BONE") {
+        Printf("[%04d] BONE %d at 0x%06X (%dB)
+", i, toc[i].id, toc[i].fileOffset, chunk_len);
+        BONE_Chunk bone_chunk(chunk_len);
+        bone_count++;
+    }
+    else if (chunk_tag == "MORF") {
+        Printf("[%04d] MORF %d at 0x%06X (%dB)
+", i, toc[i].id, toc[i].fileOffset, chunk_len);
+        MORF_Chunk morf_chunk(chunk_len);
+        morf_count++;
+    }
+    else if (chunk_tag == "SKEL") {
+        Printf("[%04d] SKEL %d at 0x%06X (%dB)
+", i, toc[i].id, toc[i].fileOffset, chunk_len);
+        SKEL_Chunk skel_chunk(chunk_len);
+        skel_count++;
+    }
+    else if (chunk_tag == "SKIN") {
+        Printf("[%04d] SKIN %d at 0x%06X (%dB)
+", i, toc[i].id, toc[i].fileOffset, chunk_len);
+        SKIN_Chunk skin_chunk(chunk_len);
+        skin_count++;
+    }
+    else {
+        // Unknown / future chunk type — dump entire chunk as opaque bytes
+        Printf("[%04d] %-4s %d at 0x%06X (%dB) — UNKNOWN TYPE (raw dump)\n",
+            i, chunk_tag, toc[i].id, toc[i].fileOffset, chunk_len);
+        if (chunk_len > 0) {
+            struct { uchar raw[chunk_len] <bgcolor=cRed, comment="Unknown chunk — raw bytes">; } unk_chunk;
+        }
+        other_count++;
+    }
+}
+
+// ============================================================
+// CRC32 VALIDATION
+//
+// Validates:
+//   1. File header CRC (0x10, covers [0x00..0x10))
+//   2. TOC metadata CRC (toc_hdr.toc_meta_crc, covers [0x14..0x2C))
+//   3. TOC body CRC (toc_body_crc, covers [0x30..TOC_FOOTER_OFFSET))
+//   4. Per-chunk preamble CRC (outer header +0x18, covers [chunk+0x00..chunk+0x18)) [H42]
+//   5. Per-chunk trailing CRC32 for all zlib chunks
+//      Formula: CRC32(format_header || zlib_stream || padding_bytes)
+//      Verified range = chunk.fileOffset + 28 to chunk.fileOffset + chunk.length - 4
+//
+// Notes:
+//   - CRC for zlib chunks is computed over [chunk_start+28 .. chunk_end-4]
+//     i.e. skipping the 28B outer header but INCLUDING format header + zlib + padding
+//   - Uses 010 built-in: Checksum(CHECKSUM_CRC32, start, length) with 0xEDB88320 poly
+//   - Non-zlib chunks (MATL, LGHT, CAM, MODL) do NOT have a trailing CRC32 (raw body only)
+// ============================================================
+
+Printf("\n=== CRC32 VALIDATION ===\n");
+
+local int crc_ok = 0, crc_fail = 0;
+local uint computed = 0, stored = 0;
+
+// 1. File header CRC [0x00..0x10)
+computed = Checksum(CHECKSUM_CRC32, 0x00, 0x10);
+stored   = file_hdr.file_header_crc;
+if (computed == stored) {
+    Printf("[CRC] File header:      OK  (0x%08X)\n", stored);
+    crc_ok++;
+} else {
+    Printf("[CRC] File header:      MISMATCH  stored=0x%08X  computed=0x%08X\n", stored, computed);
+    crc_fail++;
+}
+
+// 2. TOC metadata CRC [0x14..0x2C) = 24 bytes
+computed = Checksum(CHECKSUM_CRC32, 0x14, 0x18);
+stored   = toc_hdr.toc_meta_crc;
+if (computed == stored) {
+    Printf("[CRC] TOC metadata:     OK  (0x%08X)\n", stored);
+    crc_ok++;
+} else {
+    Printf("[CRC] TOC metadata:     MISMATCH  stored=0x%08X  computed=0x%08X\n", stored, computed);
+    crc_fail++;
+}
+
+// 3. TOC body CRC [0x30 .. TOC_FOOTER_OFFSET)
+local quad toc_body_start  = 0x30;
+local quad toc_body_len    = TOC_FOOTER_OFFSET - toc_body_start;
+computed = Checksum(CHECKSUM_CRC32, toc_body_start, toc_body_len);
+stored   = toc_body_crc;
+if (computed == stored) {
+    Printf("[CRC] TOC body:         OK  (0x%08X)\n", stored);
+    crc_ok++;
+} else {
+    Printf("[CRC] TOC body:         MISMATCH  stored=0x%08X  computed=0x%08X\n", stored, computed);
+    crc_fail++;
+}
+
+// 4. Per-chunk preamble CRC [H42] — outer header +0x18, covers [chunk+0x00..+0x18)
+local string chunk_label;
+for (i = 0; i < toc_hdr.entryCount; i++) {
+    chunk_tag = TagToStr(toc[i].tag);
+    chunk_len = toc[i].length;
+    if (chunk_tag == "IMG ") continue;  // IMG uses different scheme
+    if (chunk_len < 28) continue;
+    computed = Checksum(CHECKSUM_CRC32, toc[i].fileOffset, 0x18);
+    stored   = ReadUInt(toc[i].fileOffset + 0x18);
+    SPrintf(chunk_label, "preamble %-4s %3d", chunk_tag, toc[i].id);
+    if (computed == stored) {
+        crc_ok++;
+        // Only print first 5 to avoid flooding — remove filter to see all
+        if (i < 5) Printf("[CRC] %-26s  OK  (0x%08X)
+", chunk_label, stored);
+    } else {
+        Printf("[CRC] %-26s  MISMATCH  stored=0x%08X  computed=0x%08X
+",
+            chunk_label, stored, computed);
+        crc_fail++;
+    }
+}
+Printf("[CRC] Preamble CRC validated for %d chunks (first 5 printed)
+", toc_hdr.entryCount);
+
+// 5. Per-chunk trailing CRC32 (only for chunks with zlib — comp_size > 0)
+// CRC covers: [chunk_start + 28 .. chunk_start + chunk_length - 4]
+// i.e. bytes = chunk_length - 28 - 4 = chunk_length - 32
+local quad crc_region_start, crc_region_len;
+local string is_zlib_chunk;
+
+// Tags that have a trailing CRC32 (= have zlib + format header)
+// Raw chunks (MATL profile has body-crc but different scope; LGHT/CAM/MODL are raw-no-crc)
+// We validate: MESH, VTXB, IDXB, NODE, ANIM, VTXF, SCEN, OBJA, TEX, IMG, TRAK, CLIP
+// For CLIP/TRAK we attempt validation (unknown structure but CRC pattern likely same)
+
+for (i = 0; i < toc_hdr.entryCount; i++) {
+    chunk_tag = TagToStr(toc[i].tag);
+    chunk_len = toc[i].length;
+
+    // Skip raw chunks (no trailing CRC32)
+    if (chunk_tag == "MATL" || chunk_tag == "LGHT" || chunk_tag == "CAM ") continue;
+
+    // IMG chunks have their own hash_2 (different scope) — handled separately below
+    if (chunk_tag == "IMG ") continue;
+
+    // Skip zero-length / stub chunks
+    if (chunk_len < 32) continue;
+
+    // CRC region: from format-header start to (chunk_end - 4) exclusive
+    crc_region_start = toc[i].fileOffset + 28;  // skip 28B outer header
+    crc_region_len   = chunk_len - 28 - 4;      // exclude outer header + trailing CRC32 itself
+
+    if (crc_region_len <= 0) continue;
+
+    computed = Checksum(CHECKSUM_CRC32, crc_region_start, crc_region_len);
+    // Stored CRC32 is at chunk_start + chunk_len - 4
+    stored   = ReadUInt(toc[i].fileOffset + chunk_len - 4);
+
+    SPrintf(chunk_label, "%-4s %3d", chunk_tag, toc[i].id);
+    if (computed == stored) {
+        Printf("[CRC] chunk %-10s  OK  (0x%08X)\n", chunk_label, stored);
+        crc_ok++;
+    } else {
+        Printf("[CRC] chunk %-10s  MISMATCH  stored=0x%08X  computed=0x%08X\n",
+            chunk_label, stored, computed);
+        crc_fail++;
+    }
+}
+
+// IMG chunk hash_1 + hash_2 validation (images.mcf only)
+if (img_count > 0) {
+    Printf("\n--- IMG hash validation (%d chunks) ---\n", img_count);
+    local quad img_base;
+    local uint zsize;
+    local quad hash2_start;
+    local quad hash2_len;
+    for (i = 0; i < toc_hdr.entryCount; i++) {
+        chunk_tag = TagToStr(toc[i].tag);
+        if (chunk_tag != "IMG ") continue;
+        chunk_len = toc[i].length;
+        img_base = toc[i].fileOffset;
+
+        // hash_1: CRC32(blob[0..23]) — first 24 bytes of IMG blob
+        computed = Checksum(CHECKSUM_CRC32, img_base, 24);
+        stored   = ReadUInt(img_base + 24);
+        SPrintf(chunk_label, "IMG  %3d hash_1", toc[i].id);
+        if (computed == stored) {
+            Printf("[CRC] %-20s  OK  (0x%08X)\n", chunk_label, stored);
+            crc_ok++;
+        } else {
+            Printf("[CRC] %-20s  MISMATCH  stored=0x%08X  computed=0x%08X\n",
+                chunk_label, stored, computed);
+            crc_fail++;
+        }
+
+        // hash_2: CRC32(blob[28..36-1] (8B) + padded_zlib)
+        // Read zsize_padded from blob+12
+        zsize = ReadUInt(img_base + 12);
+        hash2_start = img_base + 28;
+        hash2_len   = 8 + zsize;
+        computed = Checksum(CHECKSUM_CRC32, hash2_start, hash2_len);
+        stored   = ReadUInt(img_base + 36 + zsize);
+        SPrintf(chunk_label, "IMG  %3d hash_2", toc[i].id);
+        if (computed == stored) {
+            Printf("[CRC] %-20s  OK  (0x%08X)\n", chunk_label, stored);
+            crc_ok++;
+        } else {
+            Printf("[CRC] %-20s  MISMATCH  stored=0x%08X  computed=0x%08X\n",
+                chunk_label, stored, computed);
+            crc_fail++;
+        }
+    }
+}
+
+// ============================================================
+// FINAL SUMMARY
+// ============================================================
+Printf("\n=== SUMMARY ===\n");
+Printf("File size: %d bytes\n", FileSize());
+Printf("Total chunks: %d\n", toc_hdr.entryCount);
+Printf("  MESH=%d  VTXB=%d  IDXB=%d  MATL=%d  MODL=%d  NODE=%d\n",
+    mesh_count, vtxb_count, idxb_count, matl_count, modl_count, node_count);
+Printf("  TEX=%d  LGHT=%d  CAM=%d  SCEN=%d  OBJA=%d  VTXF=%d\n",
+    tex_count, lght_count, cam_count, scen_count, obja_count, vtxf_count);
+Printf("  ANIM=%d  CLIP=%d  TRAK=%d  IMG=%d  other=%d\n",
+    anim_count, clip_count, trak_count, img_count, other_count);
+Printf("\nCRC validation: %d OK  %d MISMATCH\n", crc_ok, crc_fail);
+Printf("\nUniversal chunk layout (zlib chunks):\n");
+Printf("  [28B outer hdr] [N-byte format hdr] [zlib 0x78DA] [0-3B pad] [4B CRC32]\n");
+Printf("CRC32 formula: crc32(format_hdr || zlib || padding)  poly=0xEDB88320\n");
+Printf("\nTOC footer offset: 0x%04X  (= 0x34 + %d * 16)\n",
+    TOC_FOOTER_OFFSET, toc_hdr.entryCount);
+Printf("\nFormat header sizes:\n");
+Printf("  MESH=44B  VTXB=12B  IDXB=8B  MODL=28B  NODE=24B  VTXF=4B\n");
+Printf("  TEX=28B   LGHT=60B  CAM=24B  ANIM=44B  SCEN=16B  OBJA=4B\n");
+Printf("  IMG=36B   CLIP=?    TRAK=?\n");
+Printf("\nMATL profiles: 212B=A(confirmed) 308B=B(TBD) 196B=C(TBD)\n");
+Printf("  Profile A: color RGBA @ chunk+0x3C  TEX id @ chunk+0x4C\n");
+Printf("\nVTXB stride: read from format hdr +0x04 — DO NOT hardcode 32\n");
+Printf("  stride=32 layout: pos3f(+0) nrm3f(+12) uv2f(+24) — verified car_lhd.mcf\n");
+Printf("\nIDXB index type: format hdr +0x1C  1=u8  2=u16  4=u32\n");
+Printf("\nNon-zlib chunks (no trailing CRC32): MATL LGHT CAM MODL\n");
+Printf("  MATL has own body-CRC at chunk end (profile A: covers bytes[0x1C..end-4])\n");
